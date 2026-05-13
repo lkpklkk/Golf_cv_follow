@@ -1,21 +1,23 @@
 class GestureRecognizer:
     """
-    Recognizes control gestures from a person bounding-box crop.
+    Recognizes control gestures from YOLO pose keypoints.
 
     NOT YET IMPLEMENTED.
 
     Plan:
-        - Train a custom classifier on the 32 MediaPipe pose landmarks.
+        - Use the 17 COCO keypoints already produced by the pose model
+          (no extra model needed).
+        - Train a custom classifier on keypoint sequences for each gesture.
         - Each gesture class maps to a cart command (e.g. FOLLOW, STOP,
           TURN LEFT, TURN RIGHT, SPEED UP, SLOW DOWN).
-        - recognize() will accept a cropped person frame (or full frame +
-          box) and return a gesture label string or None.
+        - recognize() will accept the keypoints array from a person dict
+          and return a gesture label string or None.
 
     To implement:
-        1. Collect pose landmark sequences for each gesture.
-        2. Train a lightweight classifier (e.g. sklearn MLP or small ONNX
-           model) on the 32-pose set.
-        3. Load the model here and run inference in recognize().
+        1. Collect keypoint sequences per gesture (e.g. raised arm, wave).
+        2. Train a lightweight classifier (e.g. sklearn MLP or small ONNX)
+           on the keypoint vectors.
+        3. Load the model in __init__ and run inference in recognize().
     """
 
     def __init__(self):

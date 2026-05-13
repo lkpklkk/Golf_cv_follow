@@ -5,7 +5,8 @@ class CartController:
     """
 
     def send(self, command):
-        print(f"[CART] {command}")
+        # print(f"[CART] {command}")
+        pass
 
     def close(self):
         pass

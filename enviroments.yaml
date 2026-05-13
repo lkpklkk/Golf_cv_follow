@@ -7,5 +7,9 @@ dependencies:
   - pip
   - numpy
   - pip:
-      - ultralytics
-      - opencv-contrib-python
+      - ultralytics # YOLO detection + tracking + pose
+      - opencv-contrib-python # ArUco support
+      - torch # YOLO + OSNet-AIN re-id inference
+      - torchvision # Torchreid image transforms/model support
+      - torchreid # OSNet-AIN person re-id embeddings
+      - gdown # Torchreid pretrained OSNet-AIN weight download

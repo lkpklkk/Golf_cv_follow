@@ -1,8 +1,12 @@
 import cv2
+import config
 
 
-def _probe_cameras(max_index=5):
+def _probe_cameras(max_index=None):
     """Return a list of (index, label) for every camera that opens successfully."""
+    if max_index is None:
+        max_index = config.CAMERA_SCAN_MAX_INDEX
+
     available = []
     for i in range(max_index):
         cap = cv2.VideoCapture(i)
@@ -45,7 +49,9 @@ def pick_camera(default=0):
 
     while True:
         try:
-            raw = input(f"\nSelect camera [0-{len(cameras)-1}] (Enter = default {default}): ").strip()
+            raw = input(
+                f"\nSelect camera [0-{len(cameras)-1}] (Enter = default {default}): "
+            ).strip()
             if raw == "":
                 return default
             choice = int(raw)
