@@ -39,10 +39,12 @@ class Enroller:
         self.state = self.IDLE
         self._embeddings: list[np.ndarray] = []
         self._angle_embeddings: dict[str, np.ndarray] = {}
+        self._angle_crops: dict[str, np.ndarray] = {}
         self._candidate_view = None
         self._candidate_frames = 0
         self._last_box = None
         self.enrolled_embeddings: list[np.ndarray] = []
+        self.enrolled_gallery_items: list[tuple[str, np.ndarray]] = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -94,6 +96,7 @@ class Enroller:
         """Return to IDLE and clear any collected data."""
         self._reset_buffers()
         self.enrolled_embeddings = []
+        self.enrolled_gallery_items = []
         self._orientation = None
         self.state = self.IDLE
         print("[ReID] Enrollment reset.")
@@ -143,6 +146,7 @@ class Enroller:
         embedding = self._embedder.embed(frame, box)
         if embedding is not None:
             self._embeddings.append(embedding)
+            self.enrolled_gallery_items = [("single", self._crop(frame, box))]
             self._finalize()
             return True
         return False
@@ -171,6 +175,7 @@ class Enroller:
                 embedding = self._embedder.embed(frame, box)
                 if embedding is not None:
                     self._angle_embeddings[view] = embedding
+                    self._angle_crops[view] = self._crop(frame, box)
                     self._embeddings.append(embedding)
                     print(f"[ReID] Captured {view} view.")
 
@@ -189,12 +194,19 @@ class Enroller:
         # Keep individual sector embeddings for max-score gallery matching.
         # Each entry is already L2-normalised by the embedder.
         self.enrolled_embeddings: list[np.ndarray] = list(self._embeddings)
+        if self._mode == "360":
+            self.enrolled_gallery_items = [
+                (name, self._angle_crops[name])
+                for name in _ANGLE_LABELS
+                if name in self._angle_crops
+            ]
         self.state = self.DONE
         print(f"[ReID] Enrollment complete — {len(self._embeddings)} gallery entries.")
 
     def _reset_buffers(self):
         self._embeddings = []
         self._angle_embeddings = {}
+        self._angle_crops = {}
         self._candidate_view = None
         self._candidate_frames = 0
         self._last_box = None
@@ -225,3 +237,10 @@ class Enroller:
             and abs(h - lh) <= config.REID_VIEW_STILL_MAX_SIZE_CHANGE * h
         )
         return center_still and size_still
+
+    def _crop(self, frame, box):
+        x1, y1, x2, y2 = box
+        h, w = frame.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        return frame[y1:y2, x1:x2].copy()

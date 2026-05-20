@@ -40,6 +40,11 @@ REID_SIMILARITY_THRESHOLD = 0.55
 REID_MIN_SCORE_MARGIN = 0.08
 # Require the same new Re-ID winner for this many frames before switching.
 REID_SWITCH_CONFIRM_FRAMES = 5
+# While a selected tracker ID is visible, verify it occasionally. This catches
+# tracker ID reuse/drift without paying Re-ID cost on every frame.
+REID_VERIFY_SELECTED_EVERY_FRAMES = 15
+REID_VERIFY_SELECTED_MIN_SCORE = 0.45
+REID_VERIFY_SELECTED_MAX_MISSES = 2
 # 360 enrollment captures a view only after the same view is stable for this
 # many frames.
 REID_VIEW_STABLE_FRAMES = 5

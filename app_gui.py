@@ -43,9 +43,10 @@ class GolfTrackerGui:
         self.people = []
         self.tracked_person = None
         self.reid_matches = None
-        self.selected_track_id = None
-        self.enroll_track_id = None
+        self.target_track_id = None
         self.enroll_status = None
+        self._frame_index = 0
+        self._verify_misses = 0
         self.fps = 0.0
         self._last_time = cv2.getTickCount()
 
@@ -53,6 +54,8 @@ class GolfTrackerGui:
         self.crop_start = None
         self.crop_end = None
         self.gallery_tiles = []
+        self._gallery_placeholder_visible = True
+        self._gallery_texture_counter = 0
 
         self.live_scale_x = 1.0
         self.live_scale_y = 1.0
@@ -82,6 +85,7 @@ class GolfTrackerGui:
                 self._blank_texture(SKEL_W, SKEL_H),
                 tag="skeleton_texture",
             )
+            dpg.add_texture_registry(tag="gallery_texture_registry")
 
         with dpg.window(tag="main_window", no_title_bar=True, no_resize=True):
             with dpg.group(horizontal=True):
@@ -156,7 +160,7 @@ class GolfTrackerGui:
             dpg.add_text("Gallery: 0 embeddings", tag="gallery_count")
             dpg.add_separator()
             with dpg.child_window(tag="gallery_tiles", height=430, border=False):
-                dpg.add_text("Manual crops will appear here.")
+                dpg.add_text("Enrollment and manual gallery crops will appear here.")
 
     def _build_skeleton_panel(self):
         with dpg.child_window(width=300, height=860, border=True):
@@ -174,6 +178,7 @@ class GolfTrackerGui:
             return
 
         frame = cv2.flip(frame, 1)
+        self._frame_index += 1
         self.raw_frame = frame.copy()
         self.live_scale_x = frame.shape[1] / LIVE_W
         self.live_scale_y = frame.shape[0] / LIVE_H
@@ -189,14 +194,13 @@ class GolfTrackerGui:
 
     def _update_reid(self, frame):
         self.tracked_person = next(
-            (p for p in self.people if p["track_id"] == self.selected_track_id), None
+            (p for p in self.people if p["track_id"] == self.target_track_id), None
         )
-        self.reid_matches = None
         self.enroll_status = None
 
         if self.enroller.state == Enroller.ENROLLING:
             target = next(
-                (p for p in self.people if p["track_id"] == self.enroll_track_id),
+                (p for p in self.people if p["track_id"] == self.target_track_id),
                 None,
             )
             if target is not None:
@@ -207,6 +211,11 @@ class GolfTrackerGui:
                 )
                 if done:
                     self.matcher.set_enrolled(self.enroller.enrolled_embeddings)
+                    self._refresh_enrollment_gallery_tiles()
+                    dpg.set_value(
+                        "gallery_count",
+                        f"Gallery: {self.matcher.gallery_size} embeddings",
+                    )
 
             collected, total = self.enroller.progress
             unit = "views" if self.enroller._mode == "360" else "frames"
@@ -214,24 +223,75 @@ class GolfTrackerGui:
             if self.enroller._mode == "360":
                 self.enroll_status += f" | {self.enroller.angle_status}"
 
-        elif self.enroller.is_enrolled or self.matcher.is_ready:
-            boxes = [person["box"] for person in self.people]
-            embeddings = self.embedder.embed_many(frame, boxes)
-            embeddings_by_id = {}
-            for person, emb in zip(self.people, embeddings):
-                if emb is not None:
-                    embeddings_by_id[person["track_id"]] = emb
+        elif self.matcher.is_ready:
+            self._verify_visible_target_identity(frame)
+            self._recover_missing_target_with_reid(frame)
 
-            self.reid_matches = self.matcher.match_all(embeddings_by_id)
-            stable_id = self.matcher.select_stable_target(
-                self.reid_matches,
-                self.selected_track_id,
+    def _verify_visible_target_identity(self, frame):
+        if self.target_track_id is None or self.tracked_person is None:
+            return
+
+        if self._frame_index % config.REID_VERIFY_SELECTED_EVERY_FRAMES != 0:
+            return
+
+        emb = self.embedder.embed(frame, self.tracked_person["box"])
+        _, score = self.matcher.match(emb)
+        self.reid_matches = {self.target_track_id: score}
+
+        if score >= config.REID_VERIFY_SELECTED_MIN_SCORE:
+            self._verify_misses = 0
+            return
+
+        self._verify_misses += 1
+        if self._verify_misses < config.REID_VERIFY_SELECTED_MAX_MISSES:
+            return
+
+        self.tracked_person = None
+        self.target_track_id = None
+        self._verify_misses = 0
+
+    def _recover_missing_target_with_reid(self, frame):
+        if self.tracked_person is not None:
+            self.reid_matches = None
+            return
+
+        if not self.people:
+            self.reid_matches = None
+            return
+
+        candidates = list(self.people)
+        boxes = [person["box"] for person in candidates]
+        embeddings = self.embedder.embed_many(frame, boxes)
+
+        scores = {}
+        for person, emb in zip(candidates, embeddings):
+            if emb is None:
+                continue
+            _, score = self.matcher.match(emb)
+            scores[person["track_id"]] = score
+
+        best_id = self._select_reid_recovery(scores) if scores else None
+
+        if not scores:
+            return
+
+        self.reid_matches = scores
+        if best_id is not None:
+            self.target_track_id = best_id
+            self._verify_misses = 0
+            self.tracked_person = next(
+                (p for p in self.people if p["track_id"] == best_id), None
             )
-            if stable_id is not None:
-                self.selected_track_id = stable_id
-                self.tracked_person = next(
-                    (p for p in self.people if p["track_id"] == stable_id), None
-                )
+
+    def _select_reid_recovery(self, scores):
+        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        best_id, best_score = ranked[0]
+        second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+        if best_score < config.REID_SIMILARITY_THRESHOLD:
+            return None
+        if best_score - second_score < config.REID_MIN_SCORE_MARGIN:
+            return None
+        return best_id
 
     def _update_tracking_command(self, frame):
         if self.tracked_person is None:
@@ -255,7 +315,7 @@ class GolfTrackerGui:
         for person in self.people:
             x1, y1, x2, y2 = person["box"]
             track_id = person["track_id"]
-            selected = track_id == self.selected_track_id
+            selected = track_id == self.target_track_id
             color = (0, 255, 0) if selected else (255, 80, 40)
             label = f"ID {track_id}"
             if self.reid_matches is not None:
@@ -358,8 +418,8 @@ class GolfTrackerGui:
         y = int(pos[1] * self.live_scale_y)
         for person in self.people:
             if point_inside_box((x, y), person["box"]):
-                self.selected_track_id = person["track_id"]
-                self.enroll_track_id = person["track_id"]
+                self.target_track_id = person["track_id"]
+                self._verify_misses = 0
                 return
 
     def _on_crop_clicked(self, *args):
@@ -393,7 +453,12 @@ class GolfTrackerGui:
         box = self._crop_box_frame_coords()
         emb = self.embedder.embed(self.frozen_frame, box)
         if self.matcher.add_embedding(emb):
-            self._add_gallery_tile(self.frozen_frame, box)
+            x1, y1, x2, y2 = box
+            self._add_gallery_crop_tile(
+                self.frozen_frame[y1:y2, x1:x2],
+                title=f"Manual crop {self.matcher.gallery_size}",
+                detail="added to gallery",
+            )
             dpg.set_value("gallery_count", f"Gallery: {self.matcher.gallery_size} embeddings")
             self.enroller.state = Enroller.DONE
 
@@ -402,19 +467,37 @@ class GolfTrackerGui:
         self.crop_end = None
         self._update_crop_texture()
 
-    def _add_gallery_tile(self, frame, box):
-        x1, y1, x2, y2 = box
-        crop = frame[y1:y2, x1:x2]
+    def _refresh_enrollment_gallery_tiles(self):
+        self._clear_gallery_tiles()
+        for title, crop in self.enroller.enrolled_gallery_items:
+            self._add_gallery_crop_tile(
+                crop,
+                title=f"Enrollment {title}",
+                detail="initial gallery",
+            )
+
+    def _add_gallery_crop_tile(self, crop, title, detail):
         if crop.size == 0:
             return
-        tag = f"gallery_tex_{len(self.gallery_tiles)}"
+        if self._gallery_placeholder_visible:
+            dpg.delete_item("gallery_tiles", children_only=True)
+            self._gallery_placeholder_visible = False
+        tag = f"gallery_tex_{self._gallery_texture_counter}"
+        self._gallery_texture_counter += 1
         thumb = cv2.resize(crop, (96, 160))
         rgba = self._texture_data(thumb)
-        with dpg.texture_registry():
-            dpg.add_static_texture(96, 160, rgba, tag=tag)
+        dpg.add_dynamic_texture(
+            96,
+            160,
+            self._blank_texture(96, 160),
+            tag=tag,
+            parent="gallery_texture_registry",
+        )
+        dpg.set_value(tag, rgba)
         with dpg.group(parent="gallery_tiles"):
             dpg.add_image(tag)
-            dpg.add_text(f"Manual crop {len(self.gallery_tiles) + 1}")
+            dpg.add_text(title)
+            dpg.add_text(detail)
         self.gallery_tiles.append(tag)
 
     def _crop_box_frame_coords(self):
@@ -426,28 +509,35 @@ class GolfTrackerGui:
         return max(0, x1), max(0, y1), min(w, x2), min(h, y2)
 
     def _start_360(self, *args):
-        if self.enroll_track_id is None:
+        if self.target_track_id is None:
             return
         self.enroller.reset()
         self.enroller.start_360(self.orientation_estimator)
 
     def _start_single(self, *args):
-        if self.enroll_track_id is None:
+        if self.target_track_id is None:
             return
         self.enroller.reset()
         self.enroller.start_single()
 
     def _clear_selection(self, *args):
-        self.selected_track_id = None
-        self.enroll_track_id = None
+        self.target_track_id = None
         self.tracked_person = None
         self.reid_matches = None
+        self._verify_misses = 0
         self.enroller.reset()
         self.matcher.set_enrolled(None)
-        self.gallery_tiles = []
-        dpg.delete_item("gallery_tiles", children_only=True)
-        dpg.add_text("Manual crops will appear here.", parent="gallery_tiles")
+        self._clear_gallery_tiles()
         dpg.set_value("gallery_count", "Gallery: 0 embeddings")
+
+    def _clear_gallery_tiles(self):
+        self.gallery_tiles = []
+        self._gallery_placeholder_visible = True
+        dpg.delete_item("gallery_tiles", children_only=True)
+        dpg.add_text(
+            "Enrollment and manual gallery crops will appear here.",
+            parent="gallery_tiles",
+        )
 
     def _on_camera_selected(self, sender, value, user_data):
         try:
@@ -469,7 +559,9 @@ class GolfTrackerGui:
         self.running = running and self.cap is not None and self.cap.isOpened()
 
     def _selection_status(self):
-        if self.selected_track_id is None:
+        if self.target_track_id is None:
+            if self.matcher.is_ready:
+                return "Selected and out of frame", (0, 80, 255)
             return "No user selected", (0, 255, 255)
         if self.tracked_person is not None:
             return "Selected and in frame", (0, 255, 0)
