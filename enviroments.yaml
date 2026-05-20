@@ -13,3 +13,4 @@ dependencies:
       - torchvision # Torchreid image transforms/model support
       - torchreid # OSNet-AIN person re-id embeddings
       - gdown # Torchreid pretrained OSNet-AIN weight download
+      - dearpygui # desktop GUI

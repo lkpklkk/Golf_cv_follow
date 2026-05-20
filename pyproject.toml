@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "golf-course-cv-tracker"
+version = "0.1.0"
+description = "Desktop computer vision tracker for golf cart following experiments."
+requires-python = ">=3.11"
+dependencies = [
+  "dearpygui",
+  "gdown",
+  "numpy",
+  "opencv-contrib-python",
+  "torch",
+  "torchreid",
+  "torchvision",
+  "ultralytics",
+]
+
+[project.scripts]
+golf_cv = "app_gui:main"
+
+[tool.setuptools]
+py-modules = [
+  "app_gui",
+  "camera_selector",
+  "config",
+  "main",
+  "prototype",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["control*", "gesture*", "reid*", "tracker*", "ui*", "utils*"]

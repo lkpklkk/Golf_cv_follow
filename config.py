@@ -27,13 +27,6 @@ USE_HALF_ON_CUDA = True
 CENTER_DEAD_ZONE = 80  # pixels — offset within this range = CENTERED
 
 # -----------------------------
-# ArUco
-# -----------------------------
-# Max pixel distance from a marker center to a person box center
-# to consider them "associated"
-ARUCO_ASSOCIATION_MAX_DIST = 200
-
-# -----------------------------
 # Re-ID
 # -----------------------------
 # Torchreid model used by PersonEmbedder. OSNet-AIN is a person-ReID model

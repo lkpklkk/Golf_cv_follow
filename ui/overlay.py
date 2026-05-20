@@ -56,7 +56,6 @@ def _draw_pose_keypoints(frame, keypoints, color):
 def draw(
     frame,
     people,
-    markers,
     tracked_person,
     selected_track_id,
     gesture=None,
@@ -71,7 +70,6 @@ def draw(
     Args:
         frame:             BGR numpy array
         people:            list of person dicts from PersonTracker
-        markers:           list of marker dicts from ArucoTracker
         tracked_person:    the currently selected/matched person dict, or None
         selected_track_id: int or None
         gesture:           gesture label string or None
@@ -121,30 +119,6 @@ def draw(
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
             color,
-            2,
-        )
-
-    # --- ArUco markers ---
-    for marker in markers:
-        pts = marker["corners"]
-        marker_id = marker["id"]
-        cx, cy = marker["center"]
-        assoc_id = marker.get("track_id")
-
-        cv2.polylines(frame, [pts], True, (0, 255, 255), 2)
-        cv2.circle(frame, (cx, cy), 5, (0, 255, 255), -1)
-
-        label = f"ArUco {marker_id}"
-        if assoc_id is not None:
-            label += f" -> P{assoc_id}"
-
-        cv2.putText(
-            frame,
-            label,
-            (cx + 10, cy),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 255),
             2,
         )
 

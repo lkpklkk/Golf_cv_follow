@@ -1,0 +1,523 @@
+import cv2
+import dearpygui.dearpygui as dpg
+import numpy as np
+
+import config
+from camera_selector import _probe_cameras
+from control.cart_controller import CartController
+from control.steering import get_movement_command
+from gesture.gesture_recognizer import GestureRecognizer
+from reid.embedder import PersonEmbedder
+from reid.enroller import Enroller
+from reid.matcher import ReIDMatcher
+from reid.orientation import OrientationEstimator
+from tracker.person_tracker import PersonTracker
+from ui.overlay import _COCO_SKELETON
+from utils.geometry import point_inside_box
+
+
+LIVE_W = 840
+LIVE_H = 472
+CROP_W = 440
+CROP_H = 248
+SKEL_W = 280
+SKEL_H = 360
+
+
+class GolfTrackerGui:
+    def __init__(self):
+        self.person_tracker = PersonTracker()
+        self.gesture_recognizer = GestureRecognizer()
+        self.cart = CartController()
+        self.embedder = PersonEmbedder()
+        self.enroller = Enroller(self.embedder)
+        self.matcher = ReIDMatcher()
+        self.orientation_estimator = OrientationEstimator()
+
+        self.cap = None
+        self.camera_index = config.CAMERA_INDEX
+        self.running = False
+
+        self.frame = None
+        self.raw_frame = None
+        self.people = []
+        self.tracked_person = None
+        self.reid_matches = None
+        self.selected_track_id = None
+        self.enroll_track_id = None
+        self.enroll_status = None
+        self.fps = 0.0
+        self._last_time = cv2.getTickCount()
+
+        self.frozen_frame = None
+        self.crop_start = None
+        self.crop_end = None
+        self.gallery_tiles = []
+
+        self.live_scale_x = 1.0
+        self.live_scale_y = 1.0
+        self.crop_scale_x = 1.0
+        self.crop_scale_y = 1.0
+
+    def setup(self):
+        dpg.create_context()
+        dpg.create_viewport(title="Golf Cart CV Tracker", width=1580, height=900)
+
+        with dpg.texture_registry():
+            dpg.add_dynamic_texture(
+                LIVE_W,
+                LIVE_H,
+                self._blank_texture(LIVE_W, LIVE_H),
+                tag="live_texture",
+            )
+            dpg.add_dynamic_texture(
+                CROP_W,
+                CROP_H,
+                self._blank_texture(CROP_W, CROP_H),
+                tag="crop_texture",
+            )
+            dpg.add_dynamic_texture(
+                SKEL_W,
+                SKEL_H,
+                self._blank_texture(SKEL_W, SKEL_H),
+                tag="skeleton_texture",
+            )
+
+        with dpg.window(tag="main_window", no_title_bar=True, no_resize=True):
+            with dpg.group(horizontal=True):
+                self._build_live_panel()
+                self._build_gallery_panel()
+                self._build_skeleton_panel()
+
+        dpg.set_primary_window("main_window", True)
+        dpg.setup_dearpygui()
+        dpg.show_viewport()
+
+    def run(self):
+        self._open_camera(self.camera_index)
+        while dpg.is_dearpygui_running():
+            self._tick()
+            dpg.render_dearpygui_frame()
+        self.close()
+
+    def close(self):
+        if self.cap is not None:
+            self.cap.release()
+        self.gesture_recognizer.close()
+        self.orientation_estimator.close()
+        self.cart.close()
+        dpg.destroy_context()
+
+    def _build_live_panel(self):
+        with dpg.child_window(width=880, height=860, border=True):
+            dpg.add_text("Live Feed")
+            dpg.add_text("No user selected", tag="status_text", color=(240, 220, 80))
+            dpg.add_image("live_texture", tag="live_image")
+            with dpg.item_handler_registry(tag="live_handlers"):
+                dpg.add_item_clicked_handler(callback=self._on_live_clicked)
+            dpg.bind_item_handler_registry("live_image", "live_handlers")
+
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Start", callback=lambda *args: self._set_running(True))
+                dpg.add_button(label="Stop", callback=lambda *args: self._set_running(False))
+                dpg.add_button(label="360 Enroll", callback=self._start_360)
+                dpg.add_button(label="Single Enroll", callback=self._start_single)
+                dpg.add_button(label="Clear", callback=self._clear_selection)
+
+            with dpg.group(horizontal=True):
+                dpg.add_text("Camera")
+                cameras = _probe_cameras()
+                labels = [f"{idx}: {label}" for idx, label in cameras] or [
+                    f"{config.CAMERA_INDEX}: Default"
+                ]
+                dpg.add_combo(
+                    labels,
+                    default_value=labels[0],
+                    width=220,
+                    callback=self._on_camera_selected,
+                    user_data=[idx for idx, _ in cameras] or [config.CAMERA_INDEX],
+                )
+                dpg.add_text("", tag="fps_text")
+            dpg.add_text("", tag="enroll_text", wrap=850)
+
+    def _build_gallery_panel(self):
+        with dpg.child_window(width=460, height=860, border=True):
+            dpg.add_text("Re-ID Gallery")
+            dpg.add_text("Manual Crop")
+            dpg.add_image("crop_texture", tag="crop_image")
+            with dpg.item_handler_registry(tag="crop_handlers"):
+                dpg.add_item_clicked_handler(callback=self._on_crop_clicked)
+            dpg.bind_item_handler_registry("crop_image", "crop_handlers")
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Freeze Frame", callback=self._freeze_frame)
+                dpg.add_button(label="Save Crop", callback=self._save_manual_crop)
+                dpg.add_button(label="Reset Crop", callback=self._reset_crop)
+            dpg.add_text("Click two corners on the frozen frame, then Save Crop.", wrap=430)
+            dpg.add_text("Gallery: 0 embeddings", tag="gallery_count")
+            dpg.add_separator()
+            with dpg.child_window(tag="gallery_tiles", height=430, border=False):
+                dpg.add_text("Manual crops will appear here.")
+
+    def _build_skeleton_panel(self):
+        with dpg.child_window(width=300, height=860, border=True):
+            dpg.add_text("Skeleton")
+            dpg.add_text("Shown when selected target is in frame", wrap=270)
+            dpg.add_image("skeleton_texture")
+
+    def _tick(self):
+        if not self.running or self.cap is None:
+            return
+
+        ok, frame = self.cap.read()
+        if not ok:
+            self._set_status("Camera frame unavailable", (255, 120, 80))
+            return
+
+        frame = cv2.flip(frame, 1)
+        self.raw_frame = frame.copy()
+        self.live_scale_x = frame.shape[1] / LIVE_W
+        self.live_scale_y = frame.shape[0] / LIVE_H
+        self.people = self.person_tracker.detect(frame)
+        self._update_reid(frame)
+        self._update_tracking_command(frame)
+
+        display = self._draw_live_overlay(frame.copy())
+        self.frame = display
+        self._update_live_texture(display)
+        self._update_skeleton_texture()
+        self._update_status_text()
+
+    def _update_reid(self, frame):
+        self.tracked_person = next(
+            (p for p in self.people if p["track_id"] == self.selected_track_id), None
+        )
+        self.reid_matches = None
+        self.enroll_status = None
+
+        if self.enroller.state == Enroller.ENROLLING:
+            target = next(
+                (p for p in self.people if p["track_id"] == self.enroll_track_id),
+                None,
+            )
+            if target is not None:
+                done = self.enroller.update(
+                    frame,
+                    target["box"],
+                    keypoints=target.get("keypoints"),
+                )
+                if done:
+                    self.matcher.set_enrolled(self.enroller.enrolled_embeddings)
+
+            collected, total = self.enroller.progress
+            unit = "views" if self.enroller._mode == "360" else "frames"
+            self.enroll_status = f"ENROLLING {collected}/{total} {unit}"
+            if self.enroller._mode == "360":
+                self.enroll_status += f" | {self.enroller.angle_status}"
+
+        elif self.enroller.is_enrolled or self.matcher.is_ready:
+            boxes = [person["box"] for person in self.people]
+            embeddings = self.embedder.embed_many(frame, boxes)
+            embeddings_by_id = {}
+            for person, emb in zip(self.people, embeddings):
+                if emb is not None:
+                    embeddings_by_id[person["track_id"]] = emb
+
+            self.reid_matches = self.matcher.match_all(embeddings_by_id)
+            stable_id = self.matcher.select_stable_target(
+                self.reid_matches,
+                self.selected_track_id,
+            )
+            if stable_id is not None:
+                self.selected_track_id = stable_id
+                self.tracked_person = next(
+                    (p for p in self.people if p["track_id"] == stable_id), None
+                )
+
+    def _update_tracking_command(self, frame):
+        if self.tracked_person is None:
+            return
+        offset_x = self.tracked_person["center"][0] - (frame.shape[1] // 2)
+        self.cart.send(get_movement_command(offset_x))
+
+    def _draw_live_overlay(self, frame):
+        status, status_color = self._selection_status()
+        cv2.rectangle(frame, (0, 0), (frame.shape[1], 44), (25, 25, 25), -1)
+        cv2.putText(
+            frame,
+            status,
+            (16, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.85,
+            status_color,
+            2,
+        )
+
+        for person in self.people:
+            x1, y1, x2, y2 = person["box"]
+            track_id = person["track_id"]
+            selected = track_id == self.selected_track_id
+            color = (0, 255, 0) if selected else (255, 80, 40)
+            label = f"ID {track_id}"
+            if self.reid_matches is not None:
+                label += f" sim={self.reid_matches.get(track_id, 0.0):.2f}"
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(
+                frame,
+                label,
+                (x1, max(y1 - 8, 58)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                color,
+                2,
+            )
+            self._draw_pose(frame, person.get("keypoints"), color)
+
+        if self.enroll_status:
+            cv2.putText(
+                frame,
+                self.enroll_status,
+                (16, frame.shape[0] - 18),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.58,
+                (0, 255, 255),
+                2,
+            )
+
+        return frame
+
+    def _draw_pose(self, frame, keypoints, color):
+        if keypoints is None:
+            return
+        thresh = config.POSE_KEYPOINT_CONFIDENCE_THRESHOLD
+        for a, b in _COCO_SKELETON:
+            if keypoints[a, 2] >= thresh and keypoints[b, 2] >= thresh:
+                cv2.line(
+                    frame,
+                    (int(keypoints[a, 0]), int(keypoints[a, 1])),
+                    (int(keypoints[b, 0]), int(keypoints[b, 1])),
+                    color,
+                    2,
+                )
+        for x, y, conf in keypoints:
+            if conf >= thresh:
+                cv2.circle(frame, (int(x), int(y)), 4, color, -1)
+
+    def _update_live_texture(self, frame):
+        self._update_texture("live_texture", frame, LIVE_W, LIVE_H)
+        now = cv2.getTickCount()
+        dt = (now - self._last_time) / cv2.getTickFrequency()
+        self._last_time = now
+        self.fps = 1.0 / dt if dt > 0 else 0.0
+        dpg.set_value("fps_text", f"FPS {self.fps:.1f}")
+        dpg.set_value("enroll_text", self.enroll_status or "")
+
+    def _update_skeleton_texture(self):
+        canvas = np.full((SKEL_H, SKEL_W, 3), 18, dtype=np.uint8)
+        if self.tracked_person is not None:
+            keypoints = self.tracked_person.get("keypoints")
+            box = self.tracked_person["box"]
+            if keypoints is not None:
+                skel = self._render_skeleton_only(keypoints, box)
+                canvas = skel
+        self._set_texture_pixels("skeleton_texture", canvas)
+
+    def _render_skeleton_only(self, keypoints, box):
+        canvas = np.full((SKEL_H, SKEL_W, 3), 18, dtype=np.uint8)
+        x1, y1, x2, y2 = box
+        bw = max(float(x2 - x1), 1.0)
+        bh = max(float(y2 - y1), 1.0)
+        scale = min((SKEL_W - 50) / bw, (SKEL_H - 50) / bh)
+        ox = (SKEL_W - bw * scale) * 0.5
+        oy = (SKEL_H - bh * scale) * 0.5
+        pts = keypoints.copy()
+        pts[:, 0] = (pts[:, 0] - x1) * scale + ox
+        pts[:, 1] = (pts[:, 1] - y1) * scale + oy
+
+        color = (0, 220, 255)
+        self._draw_pose(canvas, pts, color)
+        return canvas
+
+    def _update_crop_texture(self):
+        if self.frozen_frame is None:
+            self._set_texture_pixels(
+                "crop_texture",
+                np.zeros((CROP_H, CROP_W, 3), dtype=np.uint8),
+            )
+            return
+        frame = self.frozen_frame.copy()
+        if self.crop_start is not None and self.crop_end is not None:
+            x1, y1, x2, y2 = self._crop_box_frame_coords()
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 220, 255), 3)
+        self._update_texture("crop_texture", frame, CROP_W, CROP_H)
+
+    def _on_live_clicked(self, *args):
+        pos = self._item_mouse_pos("live_image")
+        if pos is None:
+            return
+        x = int(pos[0] * self.live_scale_x)
+        y = int(pos[1] * self.live_scale_y)
+        for person in self.people:
+            if point_inside_box((x, y), person["box"]):
+                self.selected_track_id = person["track_id"]
+                self.enroll_track_id = person["track_id"]
+                return
+
+    def _on_crop_clicked(self, *args):
+        if self.frozen_frame is None:
+            return
+        pos = self._item_mouse_pos("crop_image")
+        if pos is None:
+            return
+        if self.crop_start is None or (
+            self.crop_start is not None and self.crop_end is not None
+        ):
+            self.crop_start = pos
+            self.crop_end = None
+        else:
+            self.crop_end = pos
+        self._update_crop_texture()
+
+    def _freeze_frame(self, *args):
+        if self.raw_frame is None:
+            return
+        self.frozen_frame = self.raw_frame.copy()
+        self.crop_scale_x = self.frozen_frame.shape[1] / CROP_W
+        self.crop_scale_y = self.frozen_frame.shape[0] / CROP_H
+        self.crop_start = None
+        self.crop_end = None
+        self._update_crop_texture()
+
+    def _save_manual_crop(self, *args):
+        if self.frozen_frame is None or self.crop_start is None or self.crop_end is None:
+            return
+        box = self._crop_box_frame_coords()
+        emb = self.embedder.embed(self.frozen_frame, box)
+        if self.matcher.add_embedding(emb):
+            self._add_gallery_tile(self.frozen_frame, box)
+            dpg.set_value("gallery_count", f"Gallery: {self.matcher.gallery_size} embeddings")
+            self.enroller.state = Enroller.DONE
+
+    def _reset_crop(self, *args):
+        self.crop_start = None
+        self.crop_end = None
+        self._update_crop_texture()
+
+    def _add_gallery_tile(self, frame, box):
+        x1, y1, x2, y2 = box
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return
+        tag = f"gallery_tex_{len(self.gallery_tiles)}"
+        thumb = cv2.resize(crop, (96, 160))
+        rgba = self._texture_data(thumb)
+        with dpg.texture_registry():
+            dpg.add_static_texture(96, 160, rgba, tag=tag)
+        with dpg.group(parent="gallery_tiles"):
+            dpg.add_image(tag)
+            dpg.add_text(f"Manual crop {len(self.gallery_tiles) + 1}")
+        self.gallery_tiles.append(tag)
+
+    def _crop_box_frame_coords(self):
+        x1 = int(min(self.crop_start[0], self.crop_end[0]) * self.crop_scale_x)
+        y1 = int(min(self.crop_start[1], self.crop_end[1]) * self.crop_scale_y)
+        x2 = int(max(self.crop_start[0], self.crop_end[0]) * self.crop_scale_x)
+        y2 = int(max(self.crop_start[1], self.crop_end[1]) * self.crop_scale_y)
+        h, w = self.frozen_frame.shape[:2]
+        return max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+
+    def _start_360(self, *args):
+        if self.enroll_track_id is None:
+            return
+        self.enroller.reset()
+        self.enroller.start_360(self.orientation_estimator)
+
+    def _start_single(self, *args):
+        if self.enroll_track_id is None:
+            return
+        self.enroller.reset()
+        self.enroller.start_single()
+
+    def _clear_selection(self, *args):
+        self.selected_track_id = None
+        self.enroll_track_id = None
+        self.tracked_person = None
+        self.reid_matches = None
+        self.enroller.reset()
+        self.matcher.set_enrolled(None)
+        self.gallery_tiles = []
+        dpg.delete_item("gallery_tiles", children_only=True)
+        dpg.add_text("Manual crops will appear here.", parent="gallery_tiles")
+        dpg.set_value("gallery_count", "Gallery: 0 embeddings")
+
+    def _on_camera_selected(self, sender, value, user_data):
+        try:
+            selected = int(value.split(":", 1)[0])
+        except (ValueError, IndexError):
+            selected = user_data[0]
+        self._open_camera(selected)
+
+    def _open_camera(self, index):
+        if self.cap is not None:
+            self.cap.release()
+        self.camera_index = index
+        self.cap = cv2.VideoCapture(index)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.FRAME_WIDTH)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.FRAME_HEIGHT)
+        self.running = self.cap.isOpened()
+
+    def _set_running(self, running):
+        self.running = running and self.cap is not None and self.cap.isOpened()
+
+    def _selection_status(self):
+        if self.selected_track_id is None:
+            return "No user selected", (0, 255, 255)
+        if self.tracked_person is not None:
+            return "Selected and in frame", (0, 255, 0)
+        return "Selected and out of frame", (0, 80, 255)
+
+    def _update_status_text(self):
+        status, color = self._selection_status()
+        dpg.set_value("status_text", status)
+        dpg.configure_item("status_text", color=self._bgr_to_rgba(color))
+
+    def _set_status(self, text, color):
+        dpg.set_value("status_text", text)
+        dpg.configure_item("status_text", color=self._bgr_to_rgba(color))
+
+    def _item_mouse_pos(self, item):
+        item_min = dpg.get_item_rect_min(item)
+        mouse = dpg.get_mouse_pos(local=False)
+        x = mouse[0] - item_min[0]
+        y = mouse[1] - item_min[1]
+        width, height = dpg.get_item_rect_size(item)
+        if x < 0 or y < 0 or x > width or y > height:
+            return None
+        return (x, y)
+
+    def _update_texture(self, tag, frame, width, height):
+        resized = cv2.resize(frame, (width, height))
+        self._set_texture_pixels(tag, resized)
+
+    def _set_texture_pixels(self, tag, bgr):
+        dpg.set_value(tag, self._texture_data(bgr))
+
+    def _texture_data(self, bgr):
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        alpha = np.ones((*rgb.shape[:2], 1), dtype=np.float32)
+        return np.dstack([rgb, alpha]).ravel()
+
+    def _blank_texture(self, width, height):
+        return np.zeros((height, width, 4), dtype=np.float32).ravel()
+
+    def _bgr_to_rgba(self, color):
+        return (color[2], color[1], color[0], 255)
+
+
+def main():
+    app = GolfTrackerGui()
+    app.setup()
+    app.run()
+
+
+if __name__ == "__main__":
+    main()

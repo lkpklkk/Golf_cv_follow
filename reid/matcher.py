@@ -39,6 +39,17 @@ class ReIDMatcher:
     def is_ready(self):
         return len(self._gallery) > 0
 
+    @property
+    def gallery_size(self):
+        return len(self._gallery)
+
+    def add_embedding(self, embedding: np.ndarray):
+        if embedding is None:
+            return False
+        self._gallery.append(embedding)
+        self.reset_temporal_state()
+        return True
+
     def match(self, embedding: np.ndarray) -> tuple[bool, float]:
         """
         Compare a query embedding against every gallery entry.

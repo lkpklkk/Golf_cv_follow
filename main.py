@@ -3,7 +3,6 @@ import time
 import config
 from camera_selector import pick_camera
 from tracker.person_tracker import PersonTracker
-from tracker.aruco_tracker import ArucoTracker
 from gesture.gesture_recognizer import GestureRecognizer
 from control.steering import get_movement_command
 from control.cart_controller import CartController
@@ -19,7 +18,6 @@ from reid.orientation import OrientationEstimator
 # -----------------------------
 CLICK_POINT = None
 selected_track_id = None
-selected_aruco_id = None  # ArUco ID of the selected person (for re-id)
 enroll_track_id = None  # track_id of the person queued for enrollment
 
 
@@ -33,7 +31,6 @@ def mouse_callback(event, x, y, flags, param):
 # Init
 # -----------------------------
 person_tracker = PersonTracker()
-aruco_tracker = ArucoTracker()
 gesture_recognizer = GestureRecognizer()
 cart = CartController()
 
@@ -82,10 +79,6 @@ while True:
 
     # --- Detections ---
     people = person_tracker.detect(frame)
-    markers = aruco_tracker.detect(frame)
-
-    # Associate markers to people and update the re-id mapping
-    markers = aruco_tracker.associate(markers, people)
 
     # Gesture recognition (returns None until model is trained)
     gesture = gesture_recognizer.recognize(frame)
@@ -96,34 +89,12 @@ while True:
             if point_inside_box(CLICK_POINT, person["box"]):
                 selected_track_id = person["track_id"]
                 enroll_track_id = person["track_id"]
-                # Remember ArUco ID if one is associated with this person
-                for marker in markers:
-                    if marker.get("track_id") == selected_track_id:
-                        selected_aruco_id = marker["id"]
-                        print(f"Selected person has ArUco ID: {selected_aruco_id}")
-                        break
                 print(
                     f"Selected person track ID: {selected_track_id} — "
                     "press E (360°) or S (single) to enroll"
                 )
                 break
         CLICK_POINT = None
-
-    # --- ArUco re-identification ---
-    # If the selected person disappeared from YOLO's list, try to recover
-    # them via their ArUco marker.
-    track_ids_in_frame = {p["track_id"] for p in people}
-    if (
-        selected_track_id is not None
-        and selected_track_id not in track_ids_in_frame
-        and selected_aruco_id is not None
-    ):
-        recovered = aruco_tracker.resolve_track_id(selected_aruco_id, people)
-        if recovered is not None:
-            print(
-                f"Re-identified target via ArUco {selected_aruco_id}: new track_id={recovered}"
-            )
-            selected_track_id = recovered
 
     # --- Find tracked person ---
     tracked_person = next(
@@ -186,7 +157,6 @@ while True:
     frame = draw(
         frame,
         people,
-        markers,
         tracked_person,
         selected_track_id,
         gesture,
@@ -208,7 +178,6 @@ while True:
         enroller.start_single()
     if key == ord("c"):
         selected_track_id = None
-        selected_aruco_id = None
         enroll_track_id = None
         enroller.reset()
         matcher.set_enrolled(None)
