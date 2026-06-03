@@ -1,3 +1,7 @@
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+
 # -----------------------------
 # Camera
 # -----------------------------
@@ -11,7 +15,9 @@ CAMERA_SCAN_MAX_INDEX = 2
 # -----------------------------
 # YOLO model
 # -----------------------------
-MODEL_NAME = "yolo26s-pose.pt"  # Try "yolo26s.pt" if pose model is too slow
+MODEL_NAME = str(
+    PROJECT_ROOT / "yolo26s-pose.pt"
+)  # Try "yolo26s.pt" if pose model is too slow
 TRACKER_CONFIG = "bytetrack.yaml"
 CONFIDENCE_THRESHOLD = 0.35
 IOU_THRESHOLD = 0.5
@@ -33,7 +39,7 @@ CENTER_DEAD_ZONE = 80  # pixels — offset within this range = CENTERED
 # designed for better cross-domain generalization than ImageNet classifiers.
 REID_MODEL_NAME = "osnet_ain_x1_0"
 # Public Torchreid checkpoint trained on MSMT17 for cross-domain person Re-ID.
-REID_MODEL_WEIGHTS = "weights/osnet_ain_x1_0_msmt17.pth"
+REID_MODEL_WEIGHTS = PROJECT_ROOT / "weights" / "osnet_ain_x1_0_msmt17.pth"
 # Cosine similarity threshold — tune up if getting false matches on the course
 REID_SIMILARITY_THRESHOLD = 0.55
 # Reject a Re-ID winner when it is not clearly ahead of the runner-up.
@@ -42,7 +48,7 @@ REID_MIN_SCORE_MARGIN = 0.08
 REID_SWITCH_CONFIRM_FRAMES = 5
 # While a selected tracker ID is visible, verify it occasionally. This catches
 # tracker ID reuse/drift without paying Re-ID cost on every frame.
-REID_VERIFY_SELECTED_EVERY_FRAMES = 15
+REID_VERIFY_SELECTED_EVERY_FRAMES = 60
 REID_VERIFY_SELECTED_MIN_SCORE = 0.45
 REID_VERIFY_SELECTED_MAX_MISSES = 2
 # 360 enrollment captures a view only after the same view is stable for this

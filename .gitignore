@@ -3,3 +3,5 @@
 */__pycache__
 *.pt
 *.egg-info/
+data/*
+.DS_Store

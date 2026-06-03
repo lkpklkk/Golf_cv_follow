@@ -1,0 +1,85 @@
+[data]
+samples_file = "data/processed/samples.npz"
+metadata_file = "data/processed/metadata.json"
+checkpoint_file = "weights/action_sequence_classifier.pt"
+metrics_file = "data/processed/action_classifier_metrics.json"
+split_manifest_file = "data/processed/action_classifier_split.json"
+
+[labels.label_to_id]
+other = 0
+walk = 1
+swing = 2
+
+[features]
+confidence_threshold = 0.25
+feature_names = [
+  "frame_x",
+  "frame_y",
+  "body_x",
+  "body_y",
+  "confidence",
+  "frame_dx",
+  "frame_dy",
+  "body_dx",
+  "body_dy",
+  "left_wrist_shoulder_distance",
+  "right_wrist_shoulder_distance",
+  "left_wrist_relative_speed",
+  "right_wrist_relative_speed",
+  "shoulder_axis_x",
+  "shoulder_axis_y",
+  "hip_axis_x",
+  "hip_axis_y",
+  "shoulder_rotation_delta",
+  "hip_rotation_delta",
+]
+
+[model]
+sequence_length = 30
+keypoint_count = 17
+channels = [128, 128, 256]
+kernel_size = 3
+pool_size = 2
+dropout = 0.25
+hidden_dim = 128
+
+[training]
+seed = 42
+device = "auto"
+train_ratio = 0.70
+validation_ratio = 0.15
+test_ratio = 0.15
+batch_size = 128
+num_workers = 0
+epochs = 30
+patience = 6
+learning_rate = 0.001
+weight_decay = 0.0001
+horizontal_flip_probability = 0.5
+temporal_jitter_probability = 0
+max_temporal_jitter_frames = 1
+
+[inference]
+target_fps = 15.0
+classify_stride_sec = 0.25
+max_gap_sec = 0.5
+confidence_threshold = 0.60
+fallback_label = "other"
+
+[inference.class_thresholds]
+swing = 0.60
+
+[calibration]
+label = "swing"
+minimum_precision = 0.55
+min_threshold = 0.60
+max_threshold = 0.99
+step = 0.01
+
+[review_export]
+raw_video_dir = "data/raw_videos"
+output_dir = "data/processed/false_positive_videos"
+actual_label = "other"
+predicted_label = "swing"
+max_videos = 20
+overlap_suppression_sec = 1.0

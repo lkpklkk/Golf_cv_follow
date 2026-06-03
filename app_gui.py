@@ -3,10 +3,10 @@ import dearpygui.dearpygui as dpg
 import numpy as np
 
 import config
+from action.runtime import create_live_action_components, update_live_action
 from camera_selector import _probe_cameras
 from control.cart_controller import CartController
 from control.steering import get_movement_command
-from gesture.gesture_recognizer import GestureRecognizer
 from reid.embedder import PersonEmbedder
 from reid.enroller import Enroller
 from reid.matcher import ReIDMatcher
@@ -27,8 +27,12 @@ SKEL_H = 360
 class GolfTrackerGui:
     def __init__(self):
         self.person_tracker = PersonTracker()
-        self.gesture_recognizer = GestureRecognizer()
         self.cart = CartController()
+        self.action_classifier, self.action_buffer, self.action_config = (
+            create_live_action_components()
+        )
+        self.action_prediction = None
+        self._action_target_id = None
         self.embedder = PersonEmbedder()
         self.enroller = Enroller(self.embedder)
         self.matcher = ReIDMatcher()
@@ -107,7 +111,6 @@ class GolfTrackerGui:
     def close(self):
         if self.cap is not None:
             self.cap.release()
-        self.gesture_recognizer.close()
         self.orientation_estimator.close()
         self.cart.close()
         dpg.destroy_context()
@@ -166,6 +169,7 @@ class GolfTrackerGui:
         with dpg.child_window(width=300, height=860, border=True):
             dpg.add_text("Skeleton")
             dpg.add_text("Shown when selected target is in frame", wrap=270)
+            dpg.add_text("Action: waiting", tag="action_text", wrap=270)
             dpg.add_image("skeleton_texture")
 
     def _tick(self):
@@ -184,6 +188,7 @@ class GolfTrackerGui:
         self.live_scale_y = frame.shape[0] / LIVE_H
         self.people = self.person_tracker.detect(frame)
         self._update_reid(frame)
+        self._update_action(frame)
         self._update_tracking_command(frame)
 
         display = self._draw_live_overlay(frame.copy())
@@ -299,6 +304,24 @@ class GolfTrackerGui:
         offset_x = self.tracked_person["center"][0] - (frame.shape[1] // 2)
         self.cart.send(get_movement_command(offset_x))
 
+    def _update_action(self, frame):
+        if self.target_track_id != self._action_target_id or self.tracked_person is None:
+            self.action_prediction = None
+            self._action_target_id = self.target_track_id
+
+        prediction = update_live_action(
+            classifier=self.action_classifier,
+            buffer=self.action_buffer,
+            config=self.action_config,
+            target_id=self.target_track_id,
+            tracked_person=self.tracked_person,
+            timestamp=cv2.getTickCount() / cv2.getTickFrequency(),
+            frame_width=frame.shape[1],
+            frame_height=frame.shape[0],
+        )
+        if prediction is not None:
+            self.action_prediction = prediction
+
     def _draw_live_overlay(self, frame):
         status, status_color = self._selection_status()
         cv2.rectangle(frame, (0, 0), (frame.shape[1], 44), (25, 25, 25), -1)
@@ -343,6 +366,20 @@ class GolfTrackerGui:
                 2,
             )
 
+        if self.action_prediction is not None:
+            cv2.putText(
+                frame,
+                (
+                    f"Action: {self.action_prediction.label} "
+                    f"{self.action_prediction.confidence:.2f}"
+                ),
+                (16, 72),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (0, 200, 255),
+                2,
+            )
+
         return frame
 
     def _draw_pose(self, frame, keypoints, color):
@@ -370,6 +407,16 @@ class GolfTrackerGui:
         self.fps = 1.0 / dt if dt > 0 else 0.0
         dpg.set_value("fps_text", f"FPS {self.fps:.1f}")
         dpg.set_value("enroll_text", self.enroll_status or "")
+        if self.action_prediction is None:
+            dpg.set_value("action_text", "Action: waiting")
+        else:
+            dpg.set_value(
+                "action_text",
+                (
+                    f"Action: {self.action_prediction.label} "
+                    f"({self.action_prediction.confidence:.2f})"
+                ),
+            )
 
     def _update_skeleton_texture(self):
         canvas = np.full((SKEL_H, SKEL_W, 3), 18, dtype=np.uint8)
@@ -523,6 +570,10 @@ class GolfTrackerGui:
     def _clear_selection(self, *args):
         self.target_track_id = None
         self.tracked_person = None
+        self.action_prediction = None
+        self._action_target_id = None
+        if self.action_buffer is not None:
+            self.action_buffer.reset()
         self.reid_matches = None
         self._verify_misses = 0
         self.enroller.reset()

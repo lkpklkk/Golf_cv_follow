@@ -1,0 +1,40 @@
+data:
+  raw_video_dir: "data/raw_videos"
+  annotation_file: "data/annotations/video_intervals.json"
+  processed_dir: "data/processed"
+
+labels:
+  classes:
+    - other
+    - walk
+    - swing
+  label_to_id:
+    other: 0
+    walk: 1
+    swing: 2
+
+sampling:
+  target_fps: 15
+  sequence_length: 30
+  window_sec: 2.0
+  timestamp_jitter_ratio: 0.35
+  timestamp_jitter_seed: 42
+
+windowing:
+  include_unlabeled_as_other: false
+  swing_stride_sec: 0.15
+  walk_stride_sec: 0.25
+  other_stride_sec: 0.5
+  swing_overlap_threshold: 0.3
+  walk_overlap_threshold: 0.5
+  other_overlap_threshold: 0.5
+
+priority:
+  - swing
+  - walk
+  - other
+
+pose:
+  model_name: "yolo26s-pose.pt"
+  pose_conf_threshold: 0.25
+  max_missing_frame_ratio: 0.3

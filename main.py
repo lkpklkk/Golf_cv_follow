@@ -1,9 +1,9 @@
 import cv2
 import time
 import config
+from action.runtime import create_live_action_components, update_live_action
 from camera_selector import pick_camera
 from tracker.person_tracker import PersonTracker
-from gesture.gesture_recognizer import GestureRecognizer
 from control.steering import get_movement_command
 from control.cart_controller import CartController
 from ui.overlay import draw
@@ -31,8 +31,10 @@ def mouse_callback(event, x, y, flags, param):
 # Init
 # -----------------------------
 person_tracker = PersonTracker()
-gesture_recognizer = GestureRecognizer()
 cart = CartController()
+action_classifier, action_buffer, action_config = create_live_action_components()
+action_prediction = None
+action_target_id = None
 
 embedder = PersonEmbedder()
 enroller = Enroller(embedder)
@@ -79,9 +81,6 @@ while True:
 
     # --- Detections ---
     people = person_tracker.detect(frame)
-
-    # Gesture recognition (returns None until model is trained)
-    gesture = gesture_recognizer.recognize(frame)
 
     # --- Mouse selection ---
     if CLICK_POINT is not None:
@@ -147,6 +146,23 @@ while True:
                 (p for p in people if p["track_id"] == stable_id), None
             )
 
+    # --- Action classification ---
+    if selected_track_id != action_target_id or tracked_person is None:
+        action_prediction = None
+        action_target_id = selected_track_id
+    new_action_prediction = update_live_action(
+        classifier=action_classifier,
+        buffer=action_buffer,
+        config=action_config,
+        target_id=selected_track_id,
+        tracked_person=tracked_person,
+        timestamp=now,
+        frame_width=frame.shape[1],
+        frame_height=frame.shape[0],
+    )
+    if new_action_prediction is not None:
+        action_prediction = new_action_prediction
+
     # --- Steering ---
     if tracked_person is not None:
         offset_x = tracked_person["center"][0] - (frame.shape[1] // 2)
@@ -159,7 +175,7 @@ while True:
         people,
         tracked_person,
         selected_track_id,
-        gesture,
+        action_prediction,
         fps=_fps,
         reid_matches=reid_matches,
         enrolling_id=enroll_track_id if enroller.state == Enroller.ENROLLING else None,
@@ -179,6 +195,10 @@ while True:
     if key == ord("c"):
         selected_track_id = None
         enroll_track_id = None
+        action_prediction = None
+        action_target_id = None
+        if action_buffer is not None:
+            action_buffer.reset()
         enroller.reset()
         matcher.set_enrolled(None)
         print("Selection and re-id cleared.")
@@ -188,6 +208,5 @@ while True:
 # -----------------------------
 cap.release()
 cv2.destroyAllWindows()
-gesture_recognizer.close()
 orientation_estimator.close()
 cart.close()

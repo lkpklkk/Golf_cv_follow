@@ -58,7 +58,7 @@ def draw(
     people,
     tracked_person,
     selected_track_id,
-    gesture=None,
+    action_prediction=None,
     fps=None,
     reid_matches=None,
     enrolling_id=None,
@@ -72,7 +72,7 @@ def draw(
         people:            list of person dicts from PersonTracker
         tracked_person:    the currently selected/matched person dict, or None
         selected_track_id: int or None
-        gesture:           gesture label string or None
+        action_prediction: ActionPrediction or None
         fps:               float or None
         reid_matches:      dict {track_id: similarity_score} when re-id is active,
                            None when not yet enrolled (falls back to click-selection colour)
@@ -185,11 +185,11 @@ def draw(
             2,
         )
 
-    # --- Gesture label (shown once gesture module is implemented) ---
-    if gesture:
+    # --- Action label ---
+    if action_prediction:
         cv2.putText(
             frame,
-            f"Gesture: {gesture}",
+            f"Action: {action_prediction.label} {action_prediction.confidence:.2f}",
             (20, 145),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.8,
