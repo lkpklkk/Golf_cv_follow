@@ -1,3 +1,5 @@
+from datetime import datetime
+
 import cv2
 import dearpygui.dearpygui as dpg
 import numpy as np
@@ -8,7 +10,10 @@ from pipeline.pipeline import TrackerPipeline
 from pipeline.session import TrackingSession
 from reid.enroller import Enroller
 from ui.overlay import _COCO_SKELETON
+from utils.field_session import FieldSessionManager
 from utils.geometry import point_inside_box
+from utils.gps import GpsPoller
+from utils.video_buffer import RollingVideoBuffer
 
 LIVE_W = 840
 LIVE_H = 472
@@ -42,6 +47,17 @@ class GolfTrackerGui:
         self.gallery_tiles = []
         self._gallery_placeholder_visible = True
         self._gallery_texture_counter = 0
+
+        # Field session recording
+        self.field_session: FieldSessionManager | None = None
+        self.current_hole: int | None = None
+        self.video_buffer = RollingVideoBuffer(
+            pre_seconds=config.FIELD_VIDEO_PRE_SECONDS,
+            post_seconds=config.FIELD_VIDEO_POST_SECONDS,
+        )
+        self._gps = GpsPoller(poll_interval=5.0)
+        self._prev_swing = False
+        self._swing_cooldown_end = 0.0
 
     def setup(self):
         dpg.create_context()
@@ -89,6 +105,7 @@ class GolfTrackerGui:
         if self.cap is not None:
             self.cap.release()
         self.pipeline.close()
+        self._gps.stop()
         dpg.destroy_context()
 
     def _build_live_panel(self):
@@ -126,6 +143,15 @@ class GolfTrackerGui:
                 )
                 dpg.add_text("", tag="fps_text")
             dpg.add_text("", tag="enroll_text", wrap=850)
+
+            dpg.add_separator()
+            dpg.add_text("Field Session", color=(120, 200, 255))
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Start Session", callback=self._show_start_session_modal)
+                dpg.add_button(label="Resume Session", callback=self._show_resume_session_modal)
+                dpg.add_button(label="End Hole", callback=self._end_hole)
+            dpg.add_text("Session: —  |  Hole: —  |  Shots: 0", tag="field_status_text", wrap=850, color=(180, 220, 180))
+            dpg.add_text("GPS: initializing…", tag="gps_status_text", wrap=850, color=(180, 180, 180))
 
     def _build_gallery_panel(self):
         with dpg.child_window(width=460, height=860, border=True):
@@ -169,6 +195,8 @@ class GolfTrackerGui:
         self.live_scale_x = frame.shape[1] / LIVE_W
         self.live_scale_y = frame.shape[0] / LIVE_H
 
+        self.video_buffer.push(self.raw_frame)
+
         timestamp = cv2.getTickCount() / cv2.getTickFrequency()
         self.session = self.pipeline.tick(frame, timestamp)
 
@@ -184,6 +212,8 @@ class GolfTrackerGui:
         self._update_live_texture(display)
         self._update_skeleton_texture()
         self._update_status_text()
+        self._check_swing_event(self.session.action_prediction, timestamp)
+        self._update_gps_status()
 
     def _draw_live_overlay(self, frame):
         status, status_color = self._selection_status()
@@ -523,6 +553,151 @@ class GolfTrackerGui:
 
     def _bgr_to_rgba(self, color):
         return (color[2], color[1], color[0], 255)
+
+    # ------------------------------------------------------------------ field session
+
+    def _check_swing_event(self, prediction, timestamp: float) -> None:
+        is_swing = prediction is not None and prediction.label == "swing"
+        if (
+            is_swing
+            and not self._prev_swing
+            and timestamp > self._swing_cooldown_end
+            and self.field_session is not None
+            and self.current_hole is not None
+        ):
+            self._on_swing_detected()
+            self._swing_cooldown_end = timestamp + config.FIELD_SWING_COOLDOWN_SECONDS
+        self._prev_swing = is_swing
+
+    def _on_swing_detected(self) -> None:
+        if self.field_session is None or self.current_hole is None:
+            return
+        hole = self.current_hole
+        lat, lon = self._gps.location
+        ts = datetime.now()
+        shot_num, det_num = self.field_session.add_swing(lat, lon, ts, video_path=None)
+        video_path = self.field_session.video_path_for(hole, shot_num, det_num)
+        self.field_session.update_detection_video(hole, shot_num, det_num, video_path)
+        self.field_session.save()
+        self.video_buffer.trigger_save(video_path)
+        self._update_field_status()
+
+    def _update_field_status(self) -> None:
+        if self.field_session is None:
+            dpg.set_value("field_status_text", "Session: —  |  Hole: —  |  Shots: 0")
+            return
+        hole_str = str(self.current_hole) if self.current_hole is not None else "—"
+        shots = self.field_session.shot_count(self.current_hole) if self.current_hole else 0
+        dpg.set_value(
+            "field_status_text",
+            f"Session: {self.field_session.name}  |  Hole: {hole_str}  |  Shots: {shots}",
+        )
+
+    def _update_gps_status(self) -> None:
+        lat, lon = self._gps.location
+        age = self._gps.age_seconds
+        if lat is None:
+            dpg.set_value("gps_status_text", "GPS: unavailable (grant location access in System Settings)")
+        elif age is not None and age < 15:
+            dpg.set_value("gps_status_text", f"GPS: {lat:.5f}, {lon:.5f}  ({age:.0f}s ago)")
+        else:
+            age_str = f"{age:.0f}s ago" if age is not None else "—"
+            dpg.set_value("gps_status_text", f"GPS: {lat:.5f}, {lon:.5f}  (stale: {age_str})")
+
+    def _open_field_session(self, name: str, hole: int, resume: bool) -> None:
+        if resume:
+            self.field_session = FieldSessionManager.resume(name)
+        else:
+            self.field_session = FieldSessionManager.create(name)
+        self.current_hole = hole
+        self.field_session.start_hole(hole)
+        self._update_field_status()
+
+    def _end_hole(self, *_args) -> None:
+        if self.field_session is None:
+            return
+        self.field_session.end_hole()
+        self.field_session.save()
+        self.current_hole = None
+        self._update_field_status()
+
+    # ------------------------------------------------------------------ modals
+
+    def _show_start_session_modal(self, *_args) -> None:
+        existing = FieldSessionManager.list_sessions()
+
+        with dpg.window(
+            label="Start New Session",
+            modal=True,
+            width=380,
+            height=200,
+            no_resize=True,
+            on_close=lambda: dpg.delete_item("_start_modal"),
+            tag="_start_modal",
+        ):
+            dpg.add_text("Session name (must be unique):")
+            dpg.add_input_text(tag="_start_name", width=340, hint="e.g. round_20260613")
+            dpg.add_text("Starting hole number:")
+            dpg.add_input_int(tag="_start_hole", default_value=1, min_value=1, max_value=18, width=120)
+            dpg.add_spacer(height=8)
+
+            def _confirm(*_a):
+                name = dpg.get_value("_start_name").strip()
+                hole = dpg.get_value("_start_hole")
+                if not name:
+                    return
+                if name in existing:
+                    dpg.set_value("_start_error", f'Session "{name}" already exists — use Resume.')
+                    return
+                dpg.delete_item("_start_modal")
+                self._open_field_session(name, hole, resume=False)
+
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Start", callback=_confirm)
+                dpg.add_button(label="Cancel", callback=lambda *_a: dpg.delete_item("_start_modal"))
+            dpg.add_text("", tag="_start_error", color=(255, 100, 100), wrap=360)
+
+    def _show_resume_session_modal(self, *_args) -> None:
+        sessions = FieldSessionManager.list_sessions()
+        if not sessions:
+            with dpg.window(
+                label="Resume Session",
+                modal=True,
+                width=320,
+                height=100,
+                no_resize=True,
+                tag="_resume_modal",
+            ):
+                dpg.add_text("No saved sessions found.")
+                dpg.add_button(label="Close", callback=lambda *_a: dpg.delete_item("_resume_modal"))
+            return
+
+        with dpg.window(
+            label="Resume Session",
+            modal=True,
+            width=380,
+            height=240,
+            no_resize=True,
+            on_close=lambda: dpg.delete_item("_resume_modal"),
+            tag="_resume_modal",
+        ):
+            dpg.add_text("Select session:")
+            dpg.add_listbox(sessions, tag="_resume_name", width=340, num_items=min(len(sessions), 5))
+            dpg.add_text("Hole number to continue:")
+            dpg.add_input_int(tag="_resume_hole", default_value=1, min_value=1, max_value=18, width=120)
+            dpg.add_spacer(height=8)
+
+            def _confirm(*_a):
+                name = dpg.get_value("_resume_name")
+                hole = dpg.get_value("_resume_hole")
+                if not name:
+                    return
+                dpg.delete_item("_resume_modal")
+                self._open_field_session(name, hole, resume=True)
+
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Resume", callback=_confirm)
+                dpg.add_button(label="Cancel", callback=lambda *_a: dpg.delete_item("_resume_modal"))
 
 
 def main():

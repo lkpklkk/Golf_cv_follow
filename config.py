@@ -67,3 +67,12 @@ REID_VIEW_STILL_MAX_SIZE_CHANGE = 0.12  # fraction of box width/height
 WINDOW_NAME = "Golf Cart Tracker"
 DRAW_POSE_KEYPOINTS = True
 POSE_KEYPOINT_CONFIDENCE_THRESHOLD = 0.30
+
+# -----------------------------
+# Field session recording
+# -----------------------------
+FIELD_VIDEO_PRE_SECONDS = 5.0   # seconds of pre-swing footage to include
+FIELD_VIDEO_POST_SECONDS = 3.0  # seconds of post-swing footage to include
+FIELD_SWING_COOLDOWN_SECONDS = 5.0  # minimum gap between two recorded swings
+SESSIONS_DIR = PROJECT_ROOT / "RecordedTestSwings"
+VIDEOS_DIR = PROJECT_ROOT / "RecordedTestVideos"

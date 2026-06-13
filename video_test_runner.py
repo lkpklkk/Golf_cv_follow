@@ -27,8 +27,8 @@ from utils.annotations import (
 )
 from utils.geometry import box_area
 
-TARGET_SAMPLE_FPS = (8, 10, 12)
 REALISTIC_TARGET_FPS = 15
+DEFAULT_NUM_RUNS = 3          # how many times to run each video
 ENROLLMENT_FRAMES = 3
 REID_AFTER_MISSING_FRAMES = 8
 END_AFTER_MISSING_FRAMES = 90
@@ -254,12 +254,18 @@ class OfflineVideoRun:
 
 
 class RealisticVideoRun(OfflineVideoRun):
-    """Like OfflineVideoRun but samples at ~15 fps with jitter and overlays
-    the classified action label, mimicking real-time live-inference behaviour."""
+    """
+    Samples at ~15 fps with per-interval jitter and overlays the classified
+    action label, mimicking real-time live-inference behaviour.
+
+    Run the same video multiple times with different run_index values to get
+    varied frame-timing samples and aggregate statistics.
+    """
 
     def __init__(
         self,
         video_path: Path,
+        run_index: int,
         embedder,
         reference_embeddings=None,
         action_config_path=DEFAULT_ACTION_CONFIG,
@@ -270,16 +276,22 @@ class RealisticVideoRun(OfflineVideoRun):
             embedder=embedder,
             reference_embeddings=reference_embeddings,
         )
+        self.run_index = run_index
         self.action_classifier, self.action_buffer, self.action_config = (
             create_live_action_components(action_config_path)
         )
         self.action_prediction = None
+        self._confident_swings = 0
 
-    def process(self):
+    def process(self) -> dict:
+        """
+        Run the video and return a stats dict:
+            frames_total, frames_tracked, track_rate, swing_count, ended_early
+        """
         cap = cv2.VideoCapture(str(self.video_path))
         if not cap.isOpened():
             print(f"[skip] Could not open {self.video_path}")
-            return
+            return {}
 
         source_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
@@ -289,7 +301,7 @@ class RealisticVideoRun(OfflineVideoRun):
             total_frames,
             source_fps,
             REALISTIC_TARGET_FPS,
-            seed=_seed_for(self.video_path, REALISTIC_TARGET_FPS),
+            seed=_seed_for(self.video_path, self.run_index),
         )
         writer_fps, frame_repeats = _writer_timing(REALISTIC_TARGET_FPS)
 
@@ -303,14 +315,14 @@ class RealisticVideoRun(OfflineVideoRun):
         if not writer.isOpened():
             cap.release()
             print(f"[skip] Could not create {output_path}")
-            return
+            return {}
 
         print(
-            f"[realistic] {self.video_path.name} -> {output_path.name} "
-            f"({REALISTIC_TARGET_FPS}fps target, jittered, "
-            f"{len(sample_indices)} samples)"
+            f"[run {self.run_index}] {self.video_path.name} -> {output_path.name} "
+            f"({REALISTIC_TARGET_FPS}fps ±jitter, {len(sample_indices)} samples)"
         )
 
+        frames_tracked = 0
         for sample_number, frame_index in enumerate(sample_indices):
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
             ok, frame = cap.read()
@@ -326,12 +338,29 @@ class RealisticVideoRun(OfflineVideoRun):
             for _ in range(frame_repeats):
                 writer.write(annotated)
 
+            if self.tracked_person is not None:
+                frames_tracked += 1
+
             if self.ended_early:
                 break
 
         cap.release()
         writer.release()
-        print(f"[done] {output_path}")
+
+        frames_total = sample_number + 1 if sample_indices else 0
+        track_rate = frames_tracked / frames_total if frames_total else 0.0
+        print(
+            f"[run {self.run_index}] done  "
+            f"track={track_rate:.0%}  swings={self._confident_swings}"
+            + ("  [ended early]" if self.ended_early else "")
+        )
+        return {
+            "frames_total": frames_total,
+            "frames_tracked": frames_tracked,
+            "track_rate": track_rate,
+            "swing_count": self._confident_swings,
+            "ended_early": self.ended_early,
+        }
 
     def _update_action(self, frame, timestamp):
         prediction = update_live_action(
@@ -345,7 +374,15 @@ class RealisticVideoRun(OfflineVideoRun):
             frame_height=frame.shape[0],
         )
         if prediction is not None:
+            prev = self.action_prediction
             self.action_prediction = prediction
+            # count leading edge of a confident swing
+            if (
+                prediction.is_confident
+                and prediction.label == "swing"
+                and (prev is None or not prev.is_confident or prev.label != "swing")
+            ):
+                self._confident_swings += 1
 
     def _draw(self, frame, people, sample_number, source_frame_index):
         frame = super()._draw(frame, people, sample_number, source_frame_index)
@@ -374,7 +411,9 @@ class RealisticVideoRun(OfflineVideoRun):
         return frame
 
     def _output_path(self):
-        return self.video_path.with_name(f"{self.video_path.stem}_realistic.mp4")
+        return self.video_path.with_name(
+            f"{self.video_path.stem}_test_run{self.run_index}.mp4"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +445,12 @@ def main(argv=None):
         default=DEFAULT_ACTION_CONFIG,
         help=f"Action classifier config. Default: {DEFAULT_ACTION_CONFIG}",
     )
+    parser.add_argument(
+        "--runs",
+        type=int,
+        default=DEFAULT_NUM_RUNS,
+        help=f"Number of test runs per video (each uses a different jitter seed). Default: {DEFAULT_NUM_RUNS}",
+    )
     args = parser.parse_args(argv)
 
     input_path = Path(
@@ -423,17 +468,28 @@ def main(argv=None):
             embedder,
             args.annotation_file.parent,
         )
-        for target_fps in TARGET_SAMPLE_FPS:
-            run = OfflineVideoRun(video, target_fps, embedder, reference_embeddings)
-            run.process()
+        all_stats = []
+        for run_index in range(1, args.runs + 1):
+            run = RealisticVideoRun(
+                video,
+                run_index=run_index,
+                embedder=embedder,
+                reference_embeddings=reference_embeddings,
+                action_config_path=args.action_config,
+            )
+            stats = run.process()
+            if stats:
+                all_stats.append(stats)
 
-        realistic_run = RealisticVideoRun(
-            video,
-            embedder,
-            reference_embeddings,
-            action_config_path=args.action_config,
-        )
-        realistic_run.process()
+        if all_stats:
+            avg_track = sum(s["track_rate"] for s in all_stats) / len(all_stats)
+            avg_swings = sum(s["swing_count"] for s in all_stats) / len(all_stats)
+            early_count = sum(1 for s in all_stats if s["ended_early"])
+            print(
+                f"[summary] {video.name}  runs={len(all_stats)}  "
+                f"avg_track={avg_track:.0%}  avg_swings={avg_swings:.1f}"
+                + (f"  ended_early={early_count}" if early_count else "")
+            )
 
 
 # ---------------------------------------------------------------------------

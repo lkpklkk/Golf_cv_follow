@@ -18,6 +18,11 @@ dependencies = [
   "ultralytics",
 ]
 
+[project.optional-dependencies]
+gps = [
+  "pyobjc-framework-CoreLocation",
+]
+
 [project.scripts]
 golf_cv = "golf_cv_cli:main"
 golf_cv_video_test = "video_test_runner:main"
