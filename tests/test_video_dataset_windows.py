@@ -2,7 +2,7 @@ import copy
 import unittest
 from pathlib import Path
 
-from video_test_runner import (
+from action.generate_dataset import (
     create_windows,
     load_dataset_config,
     sample_frame_timestamps,

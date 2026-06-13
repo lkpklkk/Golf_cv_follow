@@ -3,18 +3,12 @@ import dearpygui.dearpygui as dpg
 import numpy as np
 
 import config
-from action.runtime import create_live_action_components, update_live_action
 from camera_selector import _probe_cameras
-from control.cart_controller import CartController
-from control.steering import get_movement_command
-from reid.embedder import PersonEmbedder
+from pipeline.pipeline import TrackerPipeline
+from pipeline.session import TrackingSession
 from reid.enroller import Enroller
-from reid.matcher import ReIDMatcher
-from reid.orientation import OrientationEstimator
-from tracker.person_tracker import PersonTracker
 from ui.overlay import _COCO_SKELETON
 from utils.geometry import point_inside_box
-
 
 LIVE_W = 840
 LIVE_H = 472
@@ -26,17 +20,8 @@ SKEL_H = 360
 
 class GolfTrackerGui:
     def __init__(self):
-        self.person_tracker = PersonTracker()
-        self.cart = CartController()
-        self.action_classifier, self.action_buffer, self.action_config = (
-            create_live_action_components()
-        )
-        self.action_prediction = None
-        self._action_target_id = None
-        self.embedder = PersonEmbedder()
-        self.enroller = Enroller(self.embedder)
-        self.matcher = ReIDMatcher()
-        self.orientation_estimator = OrientationEstimator()
+        self.pipeline = TrackerPipeline()
+        self.session = TrackingSession()
 
         self.cap = None
         self.camera_index = config.CAMERA_INDEX
@@ -44,15 +29,12 @@ class GolfTrackerGui:
 
         self.frame = None
         self.raw_frame = None
-        self.people = []
-        self.tracked_person = None
-        self.reid_matches = None
-        self.target_track_id = None
-        self.enroll_status = None
-        self._frame_index = 0
-        self._verify_misses = 0
         self.fps = 0.0
         self._last_time = cv2.getTickCount()
+        self.live_scale_x = 1.0
+        self.live_scale_y = 1.0
+        self.crop_scale_x = 1.0
+        self.crop_scale_y = 1.0
 
         self.frozen_frame = None
         self.crop_start = None
@@ -60,11 +42,6 @@ class GolfTrackerGui:
         self.gallery_tiles = []
         self._gallery_placeholder_visible = True
         self._gallery_texture_counter = 0
-
-        self.live_scale_x = 1.0
-        self.live_scale_y = 1.0
-        self.crop_scale_x = 1.0
-        self.crop_scale_y = 1.0
 
     def setup(self):
         dpg.create_context()
@@ -111,8 +88,7 @@ class GolfTrackerGui:
     def close(self):
         if self.cap is not None:
             self.cap.release()
-        self.orientation_estimator.close()
-        self.cart.close()
+        self.pipeline.close()
         dpg.destroy_context()
 
     def _build_live_panel(self):
@@ -125,8 +101,12 @@ class GolfTrackerGui:
             dpg.bind_item_handler_registry("live_image", "live_handlers")
 
             with dpg.group(horizontal=True):
-                dpg.add_button(label="Start", callback=lambda *args: self._set_running(True))
-                dpg.add_button(label="Stop", callback=lambda *args: self._set_running(False))
+                dpg.add_button(
+                    label="Start", callback=lambda *args: self._set_running(True)
+                )
+                dpg.add_button(
+                    label="Stop", callback=lambda *args: self._set_running(False)
+                )
                 dpg.add_button(label="360 Enroll", callback=self._start_360)
                 dpg.add_button(label="Single Enroll", callback=self._start_single)
                 dpg.add_button(label="Clear", callback=self._clear_selection)
@@ -159,7 +139,9 @@ class GolfTrackerGui:
                 dpg.add_button(label="Freeze Frame", callback=self._freeze_frame)
                 dpg.add_button(label="Save Crop", callback=self._save_manual_crop)
                 dpg.add_button(label="Reset Crop", callback=self._reset_crop)
-            dpg.add_text("Click two corners on the frozen frame, then Save Crop.", wrap=430)
+            dpg.add_text(
+                "Click two corners on the frozen frame, then Save Crop.", wrap=430
+            )
             dpg.add_text("Gallery: 0 embeddings", tag="gallery_count")
             dpg.add_separator()
             with dpg.child_window(tag="gallery_tiles", height=430, border=False):
@@ -170,6 +152,7 @@ class GolfTrackerGui:
             dpg.add_text("Skeleton")
             dpg.add_text("Shown when selected target is in frame", wrap=270)
             dpg.add_text("Action: waiting", tag="action_text", wrap=270)
+            dpg.add_text("", tag="reid_score_text", wrap=270)
             dpg.add_image("skeleton_texture")
 
     def _tick(self):
@@ -182,145 +165,25 @@ class GolfTrackerGui:
             return
 
         frame = cv2.flip(frame, 1)
-        self._frame_index += 1
         self.raw_frame = frame.copy()
         self.live_scale_x = frame.shape[1] / LIVE_W
         self.live_scale_y = frame.shape[0] / LIVE_H
-        self.people = self.person_tracker.detect(frame)
-        self._update_reid(frame)
-        self._update_action(frame)
-        self._update_tracking_command(frame)
+
+        timestamp = cv2.getTickCount() / cv2.getTickFrequency()
+        self.session = self.pipeline.tick(frame, timestamp)
+
+        if self.session.gallery_updated:
+            self._refresh_enrollment_gallery_tiles()
+            dpg.set_value(
+                "gallery_count",
+                f"Gallery: {self.pipeline.matcher.gallery_size} embeddings",
+            )
 
         display = self._draw_live_overlay(frame.copy())
         self.frame = display
         self._update_live_texture(display)
         self._update_skeleton_texture()
         self._update_status_text()
-
-    def _update_reid(self, frame):
-        self.tracked_person = next(
-            (p for p in self.people if p["track_id"] == self.target_track_id), None
-        )
-        self.enroll_status = None
-
-        if self.enroller.state == Enroller.ENROLLING:
-            target = next(
-                (p for p in self.people if p["track_id"] == self.target_track_id),
-                None,
-            )
-            if target is not None:
-                done = self.enroller.update(
-                    frame,
-                    target["box"],
-                    keypoints=target.get("keypoints"),
-                )
-                if done:
-                    self.matcher.set_enrolled(self.enroller.enrolled_embeddings)
-                    self._refresh_enrollment_gallery_tiles()
-                    dpg.set_value(
-                        "gallery_count",
-                        f"Gallery: {self.matcher.gallery_size} embeddings",
-                    )
-
-            collected, total = self.enroller.progress
-            unit = "views" if self.enroller._mode == "360" else "frames"
-            self.enroll_status = f"ENROLLING {collected}/{total} {unit}"
-            if self.enroller._mode == "360":
-                self.enroll_status += f" | {self.enroller.angle_status}"
-
-        elif self.matcher.is_ready:
-            self._verify_visible_target_identity(frame)
-            self._recover_missing_target_with_reid(frame)
-
-    def _verify_visible_target_identity(self, frame):
-        if self.target_track_id is None or self.tracked_person is None:
-            return
-
-        if self._frame_index % config.REID_VERIFY_SELECTED_EVERY_FRAMES != 0:
-            return
-
-        emb = self.embedder.embed(frame, self.tracked_person["box"])
-        _, score = self.matcher.match(emb)
-        self.reid_matches = {self.target_track_id: score}
-
-        if score >= config.REID_VERIFY_SELECTED_MIN_SCORE:
-            self._verify_misses = 0
-            return
-
-        self._verify_misses += 1
-        if self._verify_misses < config.REID_VERIFY_SELECTED_MAX_MISSES:
-            return
-
-        self.tracked_person = None
-        self.target_track_id = None
-        self._verify_misses = 0
-
-    def _recover_missing_target_with_reid(self, frame):
-        if self.tracked_person is not None:
-            self.reid_matches = None
-            return
-
-        if not self.people:
-            self.reid_matches = None
-            return
-
-        candidates = list(self.people)
-        boxes = [person["box"] for person in candidates]
-        embeddings = self.embedder.embed_many(frame, boxes)
-
-        scores = {}
-        for person, emb in zip(candidates, embeddings):
-            if emb is None:
-                continue
-            _, score = self.matcher.match(emb)
-            scores[person["track_id"]] = score
-
-        best_id = self._select_reid_recovery(scores) if scores else None
-
-        if not scores:
-            return
-
-        self.reid_matches = scores
-        if best_id is not None:
-            self.target_track_id = best_id
-            self._verify_misses = 0
-            self.tracked_person = next(
-                (p for p in self.people if p["track_id"] == best_id), None
-            )
-
-    def _select_reid_recovery(self, scores):
-        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
-        best_id, best_score = ranked[0]
-        second_score = ranked[1][1] if len(ranked) > 1 else 0.0
-        if best_score < config.REID_SIMILARITY_THRESHOLD:
-            return None
-        if best_score - second_score < config.REID_MIN_SCORE_MARGIN:
-            return None
-        return best_id
-
-    def _update_tracking_command(self, frame):
-        if self.tracked_person is None:
-            return
-        offset_x = self.tracked_person["center"][0] - (frame.shape[1] // 2)
-        self.cart.send(get_movement_command(offset_x))
-
-    def _update_action(self, frame):
-        if self.target_track_id != self._action_target_id or self.tracked_person is None:
-            self.action_prediction = None
-            self._action_target_id = self.target_track_id
-
-        prediction = update_live_action(
-            classifier=self.action_classifier,
-            buffer=self.action_buffer,
-            config=self.action_config,
-            target_id=self.target_track_id,
-            tracked_person=self.tracked_person,
-            timestamp=cv2.getTickCount() / cv2.getTickFrequency(),
-            frame_width=frame.shape[1],
-            frame_height=frame.shape[0],
-        )
-        if prediction is not None:
-            self.action_prediction = prediction
 
     def _draw_live_overlay(self, frame):
         status, status_color = self._selection_status()
@@ -335,14 +198,14 @@ class GolfTrackerGui:
             2,
         )
 
-        for person in self.people:
+        for person in self.session.people:
             x1, y1, x2, y2 = person["box"]
             track_id = person["track_id"]
-            selected = track_id == self.target_track_id
+            selected = track_id == self.session.target_track_id
             color = (0, 255, 0) if selected else (255, 80, 40)
             label = f"ID {track_id}"
-            if self.reid_matches is not None:
-                label += f" sim={self.reid_matches.get(track_id, 0.0):.2f}"
+            if self.session.reid_matches is not None:
+                label += f" sim={self.session.reid_matches.get(track_id, 0.0):.2f}"
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             cv2.putText(
                 frame,
@@ -355,10 +218,10 @@ class GolfTrackerGui:
             )
             self._draw_pose(frame, person.get("keypoints"), color)
 
-        if self.enroll_status:
+        if self.session.enroll_status:
             cv2.putText(
                 frame,
-                self.enroll_status,
+                self.session.enroll_status,
                 (16, frame.shape[0] - 18),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.58,
@@ -366,12 +229,12 @@ class GolfTrackerGui:
                 2,
             )
 
-        if self.action_prediction is not None:
+        if self.session.action_prediction is not None:
             cv2.putText(
                 frame,
                 (
-                    f"Action: {self.action_prediction.label} "
-                    f"{self.action_prediction.confidence:.2f}"
+                    f"Action: {self.session.action_prediction.label} "
+                    f"{self.session.action_prediction.confidence:.2f}"
                 ),
                 (16, 72),
                 cv2.FONT_HERSHEY_SIMPLEX,
@@ -406,26 +269,43 @@ class GolfTrackerGui:
         self._last_time = now
         self.fps = 1.0 / dt if dt > 0 else 0.0
         dpg.set_value("fps_text", f"FPS {self.fps:.1f}")
-        dpg.set_value("enroll_text", self.enroll_status or "")
-        if self.action_prediction is None:
+        dpg.set_value("enroll_text", self.session.enroll_status or "")
+
+        if self.pipeline.action_classifier is None:
+            dpg.set_value("action_text", "Action: not loaded")
+        elif self.session.action_prediction is None:
             dpg.set_value("action_text", "Action: waiting")
         else:
             dpg.set_value(
                 "action_text",
                 (
-                    f"Action: {self.action_prediction.label} "
-                    f"({self.action_prediction.confidence:.2f})"
+                    f"Action: {self.session.action_prediction.label} "
+                    f"({self.session.action_prediction.confidence:.2f})"
                 ),
             )
 
+        score = (
+            self.session.reid_matches.get(self.session.target_track_id)
+            if self.session.reid_matches is not None
+            and self.session.target_track_id is not None
+            else None
+        )
+        mode = "verify" if self.session.tracked_person is not None else "recover"
+        if score is not None:
+            dpg.set_value("reid_score_text", f"ReID ({mode}): {score:.3f}")
+        elif self.session.target_track_id is None or not self.pipeline.matcher.is_ready:
+            dpg.set_value("reid_score_text", "")
+        else:
+            dpg.set_value("reid_score_text", f"ReID ({mode}): \u2014")
+
     def _update_skeleton_texture(self):
         canvas = np.full((SKEL_H, SKEL_W, 3), 18, dtype=np.uint8)
-        if self.tracked_person is not None:
-            keypoints = self.tracked_person.get("keypoints")
-            box = self.tracked_person["box"]
+        tracked = self.session.tracked_person
+        if tracked is not None:
+            keypoints = tracked.get("keypoints")
+            box = tracked["box"]
             if keypoints is not None:
-                skel = self._render_skeleton_only(keypoints, box)
-                canvas = skel
+                canvas = self._render_skeleton_only(keypoints, box)
         self._set_texture_pixels("skeleton_texture", canvas)
 
     def _render_skeleton_only(self, keypoints, box):
@@ -439,9 +319,7 @@ class GolfTrackerGui:
         pts = keypoints.copy()
         pts[:, 0] = (pts[:, 0] - x1) * scale + ox
         pts[:, 1] = (pts[:, 1] - y1) * scale + oy
-
-        color = (0, 220, 255)
-        self._draw_pose(canvas, pts, color)
+        self._draw_pose(canvas, pts, (0, 220, 255))
         return canvas
 
     def _update_crop_texture(self):
@@ -463,10 +341,9 @@ class GolfTrackerGui:
             return
         x = int(pos[0] * self.live_scale_x)
         y = int(pos[1] * self.live_scale_y)
-        for person in self.people:
+        for person in self.session.people:
             if point_inside_box((x, y), person["box"]):
-                self.target_track_id = person["track_id"]
-                self._verify_misses = 0
+                self.pipeline.select_target(person["track_id"])
                 return
 
     def _on_crop_clicked(self, *args):
@@ -495,19 +372,25 @@ class GolfTrackerGui:
         self._update_crop_texture()
 
     def _save_manual_crop(self, *args):
-        if self.frozen_frame is None or self.crop_start is None or self.crop_end is None:
+        if (
+            self.frozen_frame is None
+            or self.crop_start is None
+            or self.crop_end is None
+        ):
             return
         box = self._crop_box_frame_coords()
-        emb = self.embedder.embed(self.frozen_frame, box)
-        if self.matcher.add_embedding(emb):
+        if self.pipeline.enroll_manual_crop(self.frozen_frame, box):
             x1, y1, x2, y2 = box
             self._add_gallery_crop_tile(
                 self.frozen_frame[y1:y2, x1:x2],
-                title=f"Manual crop {self.matcher.gallery_size}",
+                title=f"Manual crop {self.pipeline.matcher.gallery_size}",
                 detail="added to gallery",
             )
-            dpg.set_value("gallery_count", f"Gallery: {self.matcher.gallery_size} embeddings")
-            self.enroller.state = Enroller.DONE
+            dpg.set_value(
+                "gallery_count",
+                f"Gallery: {self.pipeline.matcher.gallery_size} embeddings",
+            )
+            self.pipeline.enroller.state = Enroller.DONE
 
     def _reset_crop(self, *args):
         self.crop_start = None
@@ -516,7 +399,7 @@ class GolfTrackerGui:
 
     def _refresh_enrollment_gallery_tiles(self):
         self._clear_gallery_tiles()
-        for title, crop in self.enroller.enrolled_gallery_items:
+        for title, crop in self.pipeline.enroller.enrolled_gallery_items:
             self._add_gallery_crop_tile(
                 crop,
                 title=f"Enrollment {title}",
@@ -556,28 +439,14 @@ class GolfTrackerGui:
         return max(0, x1), max(0, y1), min(w, x2), min(h, y2)
 
     def _start_360(self, *args):
-        if self.target_track_id is None:
-            return
-        self.enroller.reset()
-        self.enroller.start_360(self.orientation_estimator)
+        self.pipeline.start_360_enroll()
 
     def _start_single(self, *args):
-        if self.target_track_id is None:
-            return
-        self.enroller.reset()
-        self.enroller.start_single()
+        self.pipeline.start_single_enroll()
 
     def _clear_selection(self, *args):
-        self.target_track_id = None
-        self.tracked_person = None
-        self.action_prediction = None
-        self._action_target_id = None
-        if self.action_buffer is not None:
-            self.action_buffer.reset()
-        self.reid_matches = None
-        self._verify_misses = 0
-        self.enroller.reset()
-        self.matcher.set_enrolled(None)
+        self.pipeline.clear()
+        self.session = TrackingSession()
         self._clear_gallery_tiles()
         dpg.set_value("gallery_count", "Gallery: 0 embeddings")
 
@@ -610,11 +479,11 @@ class GolfTrackerGui:
         self.running = running and self.cap is not None and self.cap.isOpened()
 
     def _selection_status(self):
-        if self.target_track_id is None:
-            if self.matcher.is_ready:
+        if self.session.target_track_id is None:
+            if self.pipeline.matcher.is_ready:
                 return "Selected and out of frame", (0, 80, 255)
             return "No user selected", (0, 255, 255)
-        if self.tracked_person is not None:
+        if self.session.tracked_person is not None:
             return "Selected and in frame", (0, 255, 0)
         return "Selected and out of frame", (0, 80, 255)
 

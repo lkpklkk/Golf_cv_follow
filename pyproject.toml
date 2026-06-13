@@ -19,8 +19,9 @@ dependencies = [
 ]
 
 [project.scripts]
-golf_cv = "app_gui:main"
+golf_cv = "golf_cv_cli:main"
 golf_cv_video_test = "video_test_runner:main"
+golf_cv_generate_dataset = "action.generate_dataset:main"
 golf_cv_annotate = "utils.annotate_intervals:main"
 golf_cv_train_action = "action.train:main"
 
@@ -29,11 +30,11 @@ py-modules = [
   "app_gui",
   "camera_selector",
   "config",
+  "golf_cv_cli",
   "main",
-  "prototype",
   "video_test_runner",
 ]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["action*", "control*", "gesture*", "reid*", "tracker*", "ui*", "utils*"]
+include = ["action*", "control*", "gesture*", "pipeline*", "reid*", "tracker*", "ui*", "utils*"]

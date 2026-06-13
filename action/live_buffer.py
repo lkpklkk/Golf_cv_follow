@@ -32,7 +32,7 @@ class ActionSequenceBuffer:
         self.frame_height = None
 
     def add(self, target_id, timestamp, keypoints, frame_width, frame_height):
-        if target_id is None or keypoints is None:
+        if target_id is None:
             self.reset()
             return None
 
@@ -40,6 +40,11 @@ class ActionSequenceBuffer:
         if self._target_id != target_id:
             self.reset()
             self._target_id = target_id
+
+        # Person temporarily undetected: pause without resetting the history.
+        # The timestamp-gap check below handles genuine long disappearances.
+        if keypoints is None:
+            return None
 
         if self._samples and timestamp - self._samples[-1][0] > self.max_gap_sec:
             self.reset()
@@ -71,7 +76,9 @@ class ActionSequenceBuffer:
         if not self._samples or self._samples[0][0] > start_time:
             return None
 
-        timestamps = np.asarray([sample[0] for sample in self._samples], dtype=np.float64)
+        timestamps = np.asarray(
+            [sample[0] for sample in self._samples], dtype=np.float64
+        )
         poses = [sample[1] for sample in self._samples]
         targets = start_time + np.arange(self.sequence_length) / self.target_fps
         indices = np.searchsorted(timestamps, targets)
@@ -84,7 +91,9 @@ class ActionSequenceBuffer:
                 candidates.append(right - 1)
             if not candidates:
                 return None
-            selected = min(candidates, key=lambda index: abs(timestamps[index] - target))
+            selected = min(
+                candidates, key=lambda index: abs(timestamps[index] - target)
+            )
             if abs(timestamps[selected] - target) > self.max_gap_sec:
                 return None
             output.append(poses[selected])

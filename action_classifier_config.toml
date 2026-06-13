@@ -1,17 +1,25 @@
 [data]
+# Compressed NumPy archive of training samples (X, y, video_ids, timestamps, frame dims)
 samples_file = "data/processed/samples.npz"
+# Per-sample JSON metadata: video name, start/end times, frame size, source interval
 metadata_file = "data/processed/metadata.json"
+# Saved model checkpoint (.pt) written after training and loaded at inference time
 checkpoint_file = "weights/action_sequence_classifier.pt"
+# JSON file where training metrics (accuracy, F1, calibration results) are written
 metrics_file = "data/processed/action_classifier_metrics.json"
+# JSON file recording which videos landed in each train/val/test split
 split_manifest_file = "data/processed/action_classifier_split.json"
 
 [labels.label_to_id]
+# Background / no-action class; also used as the fallback when confidence is too low
 other = 0
 walk = 1
 swing = 2
 
 [features]
+# Minimum YOLO keypoint confidence to treat a keypoint as valid; below this the position is zeroed
 confidence_threshold = 0.25
+# Ordered list of per-keypoint features fed to the model — must match preprocessing.py exactly
 feature_names = [
   "frame_x",
   "frame_y",
@@ -35,51 +43,89 @@ feature_names = [
 ]
 
 [model]
+# Number of frames per input clip; at target_fps=15 this equals 2 seconds of motion
 sequence_length = 30
+# COCO skeleton keypoint count (standard: 17)
 keypoint_count = 17
+# Output channel sizes for each Conv1D block; list length sets the number of blocks
 channels = [128, 128, 256]
+# Temporal convolution kernel width in frames (each conv sees this many consecutive frames)
 kernel_size = 3
+# MaxPool1d downsampling factor applied after each conv block (reduces temporal resolution)
 pool_size = 2
+# Dropout probability applied after each conv block and before the final linear layer
 dropout = 0.25
+# Hidden units in the fully-connected layer between flattened CNN output and class logits
 hidden_dim = 128
 
 [training]
+# Random seed for reproducible splits and weight initialisation
 seed = 42
+# PyTorch device: "auto" picks CUDA when available, otherwise CPU
 device = "auto"
+# Fraction of data (grouped by video) assigned to the training set
 train_ratio = 0.70
+# Fraction assigned to validation — used for early stopping and threshold calibration
 validation_ratio = 0.15
+# Fraction assigned to test — final held-out evaluation only
 test_ratio = 0.15
+# Samples per gradient update step
 batch_size = 128
+# DataLoader worker processes for data loading (0 = load on the main thread)
 num_workers = 0
+# Hard cap on training iterations
 epochs = 30
+# Early-stopping patience: halt after this many epochs with no improvement in val macro F1
 patience = 6
+# AdamW initial learning rate
 learning_rate = 0.001
+# AdamW L2 regularisation strength
 weight_decay = 0.0001
+# Probability of randomly mirroring a sample left-right during training (left/right keypoints are also swapped)
 horizontal_flip_probability = 0.5
+# Probability of applying temporal jitter augmentation to a training sample
 temporal_jitter_probability = 0
+# Maximum frame shift applied when temporal jitter is active
 max_temporal_jitter_frames = 1
 
 [inference]
+# Playback rate the live buffer resamples incoming poses to before classification
 target_fps = 15.0
+# Minimum seconds between consecutive classification calls in the live buffer (throttles model invocations)
 classify_stride_sec = 0.25
-max_gap_sec = 0.5
-confidence_threshold = 0.60
+# If two consecutive pose timestamps are further apart than this, the buffer resets (treats as a new track)
+max_gap_sec = 2.0
+# Default minimum softmax probability for accepting the top class; below this, fallback_label is returned
+confidence_threshold = 0.75
+# Label returned when no class meets its confidence threshold
 fallback_label = "other"
 
 [inference.class_thresholds]
-swing = 0.60
+# Per-class probability override for "swing"; effective threshold is max(this, confidence_threshold)
+swing = 0.90
 
 [calibration]
+# Class whose decision threshold is swept on the validation set after training
 label = "swing"
+# A candidate threshold is only accepted if its precision on the validation set meets this minimum
 minimum_precision = 0.55
+# Lower bound of the threshold sweep
 min_threshold = 0.60
+# Upper bound of the threshold sweep
 max_threshold = 0.99
+# Step size between candidate thresholds during the sweep
 step = 0.01
 
 [review_export]
+# Root directory containing the original source videos (used to extract review clips)
 raw_video_dir = "data/raw_videos"
+# Directory where false-positive review clips are written
 output_dir = "data/processed/false_positive_videos"
+# True class of samples to treat as false positives
 actual_label = "other"
+# Predicted class that defines a false positive (model says this but actual differs)
 predicted_label = "swing"
+# Maximum number of review clips to export
 max_videos = 20
+# Minimum time gap (seconds) between exported clips from the same video; prevents near-duplicate clips
 overlap_suppression_sec = 1.0

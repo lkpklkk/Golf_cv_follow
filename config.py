@@ -41,15 +41,18 @@ REID_MODEL_NAME = "osnet_ain_x1_0"
 # Public Torchreid checkpoint trained on MSMT17 for cross-domain person Re-ID.
 REID_MODEL_WEIGHTS = PROJECT_ROOT / "weights" / "osnet_ain_x1_0_msmt17.pth"
 # Cosine similarity threshold — tune up if getting false matches on the course
-REID_SIMILARITY_THRESHOLD = 0.55
+REID_SIMILARITY_THRESHOLD = 0.65
 # Reject a Re-ID winner when it is not clearly ahead of the runner-up.
 REID_MIN_SCORE_MARGIN = 0.08
 # Require the same new Re-ID winner for this many frames before switching.
 REID_SWITCH_CONFIRM_FRAMES = 5
+# If a non-target person scores this much higher than the current target while
+# the target is visible, immediately reassign tracking to that person.
+REID_SWITCH_BETTER_MARGIN = 0.10
 # While a selected tracker ID is visible, verify it occasionally. This catches
 # tracker ID reuse/drift without paying Re-ID cost on every frame.
 REID_VERIFY_SELECTED_EVERY_FRAMES = 60
-REID_VERIFY_SELECTED_MIN_SCORE = 0.45
+REID_VERIFY_SELECTED_MIN_SCORE = 0.55
 REID_VERIFY_SELECTED_MAX_MISSES = 2
 # 360 enrollment captures a view only after the same view is stable for this
 # many frames.

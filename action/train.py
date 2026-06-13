@@ -27,7 +27,7 @@ from action.training import (
 )
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Train the golf action sequence classifier.")
     parser.add_argument(
         "--config",
@@ -35,7 +35,7 @@ def main():
         default=Path("action_classifier_config.toml"),
         help="Action classifier TOML config.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     train_from_config(args.config)
 
 
