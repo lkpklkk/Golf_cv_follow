@@ -41,7 +41,7 @@ REID_MODEL_NAME = "osnet_ain_x1_0"
 # Public Torchreid checkpoint trained on MSMT17 for cross-domain person Re-ID.
 REID_MODEL_WEIGHTS = PROJECT_ROOT / "weights" / "osnet_ain_x1_0_msmt17.pth"
 # Cosine similarity threshold — tune up if getting false matches on the course
-REID_SIMILARITY_THRESHOLD = 0.65
+REID_SIMILARITY_THRESHOLD = 0.80
 # Reject a Re-ID winner when it is not clearly ahead of the runner-up.
 REID_MIN_SCORE_MARGIN = 0.08
 # Require the same new Re-ID winner for this many frames before switching.
@@ -71,7 +71,7 @@ POSE_KEYPOINT_CONFIDENCE_THRESHOLD = 0.30
 # -----------------------------
 # Field session recording
 # -----------------------------
-FIELD_VIDEO_PRE_SECONDS = 5.0   # seconds of pre-swing footage to include
+FIELD_VIDEO_PRE_SECONDS = 5.0  # seconds of pre-swing footage to include
 FIELD_VIDEO_POST_SECONDS = 3.0  # seconds of post-swing footage to include
 FIELD_SWING_COOLDOWN_SECONDS = 5.0  # minimum gap between two recorded swings
 SESSIONS_DIR = PROJECT_ROOT / "RecordedTestSwings"

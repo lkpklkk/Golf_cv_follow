@@ -5,3 +5,5 @@
 *.egg-info/
 data/*
 .DS_Store
+RecordedTestSwings/
+RecordedTestVideos/
