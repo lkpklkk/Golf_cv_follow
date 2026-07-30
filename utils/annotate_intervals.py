@@ -1,3 +1,4 @@
+import argparse
 import cv2
 import json
 from pathlib import Path
@@ -6,6 +7,10 @@ VIDEO_DIR = Path("data/raw_videos")
 OUT_FILE = Path("data/annotations/video_intervals.json")
 REFERENCE_FRAME_DIR = Path("data/annotations/embedding_frames")
 WINDOW_NAME = "Golf Swing / Walk Annotator"
+
+HOLDOUT_VIDEO_DIR = Path("data/hold_out")
+EVENTS_OUT_FILE = HOLDOUT_VIDEO_DIR / "impact_events.json"
+EVENTS_WINDOW_NAME = "Golf Impact Event Annotator"
 
 SUPPORTED_EXTS = [".mp4", ".mov", ".avi", ".mkv"]
 PLAYBACK_SPEEDS = [0.25, 0.5, 1.0, 1.5, 2.0, 4.0]
@@ -635,6 +640,353 @@ def annotate_video(video_path: Path):
     return intervals, reference_frames, "next"
 
 
+# ---------------------------------------------------------------------------
+# Impact-event mode
+#
+# Holdout footage is never trained on, so it never goes through window
+# generation and never needs intervals. A single impact frame per swing is
+# enough, and impact is visually unambiguous in a way that "when does a swing
+# start" is not. Existing interval annotations are untouched by this mode.
+# ---------------------------------------------------------------------------
+
+
+def draw_events_overlay(
+    frame,
+    video_name,
+    current_frame,
+    total_frames,
+    current_sec,
+    impacts,
+    practice_swings,
+    playback_speed,
+    paused,
+):
+    display = frame.copy()
+
+    status = "PAUSED" if paused else "PLAYING"
+    lines = [
+        f"Video: {video_name}",
+        f"Frame: {current_frame}/{max(0, total_frames - 1)} | Time: {current_sec:.2f}s | {status} | {playback_speed:g}x",
+        f"Impacts: {len(impacts)} | Practice swings: {len(practice_swings)}",
+        "SPACE play/pause | I impact | P practice swing | U undo",
+        "[/] speed | ,/. frame | A/D jump 5s | N next | K skip | Q save+quit",
+    ]
+
+    y = 30
+    for line in lines:
+        cv2.putText(
+            display, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA
+        )
+        y += 28
+
+    recent = sorted((*((s, "impact") for s in impacts), *((s, "practice") for s in practice_swings)))[-5:]
+    y += 10
+    cv2.putText(
+        display,
+        "Recent marks:",
+        (20, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (255, 255, 0),
+        2,
+        cv2.LINE_AA,
+    )
+    y += 28
+    for sec, kind in recent:
+        cv2.putText(
+            display,
+            f"{kind}: {sec:.2f}s",
+            (20, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+        y += 24
+
+    return display
+
+
+def add_event_mark(marks, other_marks, sec, kind):
+    """Append sec to marks unless this exact instant is already marked."""
+    rounded = round(sec, 3)
+    if rounded in marks:
+        print(f"Frame already marked as {kind} ({rounded:.2f}s).")
+        return False
+    if rounded in other_marks:
+        print(f"Frame already marked with the other event type ({rounded:.2f}s).")
+        return False
+    marks.append(rounded)
+    print(f"Marked {kind} at {rounded:.2f}s")
+    return True
+
+
+def annotate_video_events(video_path: Path, existing_entry=None):
+    """
+    Mark impact instants in a video.
+
+    Returns (impacts_sec, practice_swings_sec, fps, status).
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        print(f"Could not open {video_path}")
+        return [], [], 0.0, "error"
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = 30
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration_sec = frame_to_seconds(total_frames, fps)
+
+    existing_entry = existing_entry or {}
+    impacts = [round(float(s), 3) for s in existing_entry.get("impacts_sec", [])]
+    practice_swings = [
+        round(float(s), 3) for s in existing_entry.get("practice_swings_sec", [])
+    ]
+    # Marks are appended in the order they were made so U undoes the last one.
+    mark_order = [(s, "impact") for s in impacts] + [
+        (s, "practice") for s in practice_swings
+    ]
+
+    paused = False
+    playback_speed_index = DEFAULT_PLAYBACK_SPEED_INDEX
+
+    cv2.namedWindow(EVENTS_WINDOW_NAME)
+
+    print(f"\nLabeling impacts: {video_path.name}")
+    print(f"FPS: {fps:.2f}, duration: {duration_sec:.2f}s")
+    if mark_order:
+        print(f"Loaded {len(impacts)} impact(s), {len(practice_swings)} practice swing(s).")
+    print("Controls:")
+    print("SPACE = play/pause")
+    print("I = mark current frame as impact")
+    print("P = mark current frame as practice swing")
+    print("U = delete last mark")
+    print("[ / ] = slower / faster playback")
+    print(", / . = previous / next frame")
+    print("A / D = back / forward 5 sec")
+    print("N = save and next")
+    print("K = skip (discard marks for this video)")
+    print("Q = save and quit")
+
+    last_frame = None
+
+    while True:
+        if not paused:
+            ret, frame = cap.read()
+            if not ret:
+                print("Reached end of video.")
+                break
+            last_frame = frame
+        else:
+            if last_frame is None:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                last_frame = frame
+            frame = last_frame
+
+        current_frame = get_current_frame_idx(cap)
+        current_sec = frame_to_seconds(current_frame, fps)
+
+        display = draw_events_overlay(
+            frame=frame,
+            video_name=video_path.name,
+            current_frame=current_frame,
+            total_frames=total_frames,
+            current_sec=current_sec,
+            impacts=impacts,
+            practice_swings=practice_swings,
+            playback_speed=PLAYBACK_SPEEDS[playback_speed_index],
+            paused=paused,
+        )
+        cv2.imshow(EVENTS_WINDOW_NAME, display)
+
+        wait_ms = (
+            0
+            if paused
+            else playback_delay_ms(fps, PLAYBACK_SPEEDS[playback_speed_index])
+        )
+        key = cv2.waitKey(wait_ms) & 0xFF
+
+        # No key pressed during playback
+        if key == 255:
+            continue
+
+        # SPACE: play/pause
+        if key == ord(" "):
+            paused = not paused
+
+        # i: mark impact
+        elif key in (ord("i"), ord("I")):
+            paused = True
+            if add_event_mark(impacts, practice_swings, current_sec, "impact"):
+                mark_order.append((round(current_sec, 3), "impact"))
+
+        # p: mark practice swing
+        elif key in (ord("p"), ord("P")):
+            paused = True
+            if add_event_mark(practice_swings, impacts, current_sec, "practice"):
+                mark_order.append((round(current_sec, 3), "practice"))
+
+        # u: delete last mark
+        elif key in (ord("u"), ord("U")):
+            if not mark_order:
+                print("Nothing to undo.")
+            else:
+                sec, kind = mark_order.pop()
+                target = impacts if kind == "impact" else practice_swings
+                if sec in target:
+                    target.remove(sec)
+                print(f"Removed {kind} mark at {sec:.2f}s")
+
+        # [: slower playback
+        elif key == ord("["):
+            playback_speed_index = max(0, playback_speed_index - 1)
+            print(f"Playback speed: {PLAYBACK_SPEEDS[playback_speed_index]:g}x")
+
+        # ]: faster playback
+        elif key == ord("]"):
+            playback_speed_index = min(
+                len(PLAYBACK_SPEEDS) - 1, playback_speed_index + 1
+            )
+            print(f"Playback speed: {PLAYBACK_SPEEDS[playback_speed_index]:g}x")
+
+        # ,: previous frame
+        elif key == ord(","):
+            frame, target_frame = read_frame_at(cap, current_frame - 1, total_frames)
+            if frame is not None:
+                last_frame = frame
+                paused = True
+                print(
+                    f"Moved to frame {target_frame}, "
+                    f"{frame_to_seconds(target_frame, fps):.2f}s"
+                )
+
+        # .: next frame
+        elif key == ord("."):
+            frame, target_frame = read_frame_at(cap, current_frame + 1, total_frames)
+            if frame is not None:
+                last_frame = frame
+                paused = True
+                print(
+                    f"Moved to frame {target_frame}, "
+                    f"{frame_to_seconds(target_frame, fps):.2f}s"
+                )
+
+        # a: back 5 seconds.
+        # Unlike interval mode there is no floor here: marks are instants, so
+        # seeking back past one cannot leave a half-open annotation.
+        elif key in (ord("a"), ord("A")):
+            target_frame = max(0, current_frame - seconds_to_frame(5.0, fps))
+            frame, target_frame = read_frame_at(cap, target_frame, total_frames)
+            if frame is not None:
+                last_frame = frame
+                paused = True
+                print(
+                    f"Moved back to frame {target_frame}, "
+                    f"{frame_to_seconds(target_frame, fps):.2f}s"
+                )
+
+        # d: forward 5 seconds
+        elif key in (ord("d"), ord("D")):
+            target_frame = min(
+                current_frame + seconds_to_frame(5.0, fps), total_frames - 1
+            )
+            frame, target_frame = read_frame_at(cap, target_frame, total_frames)
+            if frame is not None:
+                last_frame = frame
+                paused = True
+                print(
+                    f"Moved forward to frame {target_frame}, "
+                    f"{frame_to_seconds(target_frame, fps):.2f}s"
+                )
+
+        # n: save and next
+        elif key in (ord("n"), ord("N")):
+            print("Save and next.")
+            cap.release()
+            return sorted(impacts), sorted(practice_swings), fps, "next"
+
+        # k: skip current video
+        elif key in (ord("k"), ord("K")):
+            print("Skipped video.")
+            cap.release()
+            return [], [], fps, "skip"
+
+        # q: save and quit whole program
+        elif key in (ord("q"), ord("Q")):
+            print("Save and quit.")
+            cap.release()
+            return sorted(impacts), sorted(practice_swings), fps, "quit"
+
+    cap.release()
+    return sorted(impacts), sorted(practice_swings), fps, "next"
+
+
+def merge_or_replace_events(events, video_name, fps, impacts, practice_swings):
+    events = [e for e in events if e.get("video") != video_name]
+    events.append(
+        {
+            "video": video_name,
+            "fps": round(float(fps), 3),
+            "impacts_sec": sorted(round(float(s), 3) for s in impacts),
+            "practice_swings_sec": sorted(round(float(s), 3) for s in practice_swings),
+        }
+    )
+    return sorted(events, key=lambda e: e["video"])
+
+
+def events_main(video_dir: Path, out_file: Path):
+    videos = get_video_files(video_dir)
+    if not videos:
+        print(f"No videos found in {video_dir}")
+        return
+
+    events = load_existing_annotations(out_file)
+    events_by_video = {e.get("video"): e for e in events if e.get("video")}
+
+    print(f"Found {len(videos)} videos in {video_dir}.")
+    print(f"Existing event annotations: {len(events_by_video)}")
+
+    for video_path in videos:
+        existing = events_by_video.get(video_path.name)
+        if existing is not None:
+            answer = (
+                input(f"{video_path.name} already labeled. Relabel? [y/N]: ")
+                .strip()
+                .lower()
+            )
+            if answer not in ("y", "yes"):
+                continue
+
+        impacts, practice_swings, fps, status = annotate_video_events(
+            video_path, existing_entry=existing
+        )
+        if status == "error":
+            continue
+        if status == "skip":
+            continue
+
+        events = merge_or_replace_events(
+            events, video_path.name, fps, impacts, practice_swings
+        )
+        events_by_video = {e.get("video"): e for e in events if e.get("video")}
+        save_annotations(out_file, events)
+        print(
+            f"Saved {len(impacts)} impact(s) and {len(practice_swings)} practice "
+            f"swing(s) for {video_path.name} to {out_file}"
+        )
+
+        if status == "quit":
+            break
+
+    cv2.destroyAllWindows()
+    print("Done.")
+
+
 def merge_or_replace_annotation(
     annotations,
     video_name,
@@ -656,14 +1008,53 @@ def merge_or_replace_annotation(
     return annotations
 
 
-def main():
-    videos = get_video_files(VIDEO_DIR)
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Annotate golf footage: action intervals, or impact events."
+    )
+    parser.add_argument(
+        "--events",
+        action="store_true",
+        help=(
+            "Impact-event mode: mark a single frame per swing instead of "
+            f"intervals. Defaults to {HOLDOUT_VIDEO_DIR} -> {EVENTS_OUT_FILE}."
+        ),
+    )
+    parser.add_argument(
+        "--video-dir",
+        type=Path,
+        default=None,
+        help="Directory of videos to annotate.",
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Output annotation JSON file.",
+    )
+    return parser.parse_args(argv)
 
-    if not videos:
-        print(f"No videos found in {VIDEO_DIR}")
+
+def main(argv=None):
+    args = parse_args(argv)
+
+    if args.events:
+        events_main(
+            video_dir=args.video_dir or HOLDOUT_VIDEO_DIR,
+            out_file=args.out or EVENTS_OUT_FILE,
+        )
         return
 
-    annotations = load_existing_annotations(OUT_FILE)
+    video_dir = args.video_dir or VIDEO_DIR
+    out_file = args.out or OUT_FILE
+
+    videos = get_video_files(video_dir)
+
+    if not videos:
+        print(f"No videos found in {video_dir}")
+        return
+
+    annotations = load_existing_annotations(out_file)
     already_annotated = {a["video"] for a in annotations}
     videos = choose_video_queue(videos, annotations)
 
@@ -692,8 +1083,8 @@ def main():
             skipped=skipped,
         )
 
-        save_annotations(OUT_FILE, annotations)
-        print(f"Saved annotations to {OUT_FILE}")
+        save_annotations(out_file, annotations)
+        print(f"Saved annotations to {out_file}")
 
         if status == "quit":
             break

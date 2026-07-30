@@ -2,6 +2,9 @@ data:
   raw_video_dir: "data/raw_videos"
   annotation_file: "data/annotations/video_intervals.json"
   processed_dir: "data/processed"
+  # Never trained on; generation aborts if any of these filenames reaches the
+  # sample metadata. Labeled as impact events in data/hold_out/impact_events.json.
+  holdout_dir: "data/hold_out"
 
 labels:
   classes:

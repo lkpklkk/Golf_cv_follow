@@ -22,6 +22,7 @@ from reid.matcher import ReIDMatcher
 from ui.overlay import _COCO_SKELETON
 from utils.annotations import (
     discover_videos,
+    holdout_video_names,
     load_annotations,
     load_reference_embeddings,
     resolve_reference_image_path,
@@ -100,6 +101,25 @@ class DatasetPoseEstimator:
 # ---------------------------------------------------------------------------
 
 
+def assert_no_holdout_videos(video_names, holdout_names: set[str], source) -> None:
+    """
+    Fail loudly if any holdout filename shows up in a training-set source.
+
+    `data/hold_out/` sitting outside `raw_video_dir` is only a convention, and a
+    convention is not enough here: training on the holdout would invalidate
+    every number later measured against it. Checked both on the discovered
+    video list and on the generated sample metadata.
+    """
+    if not holdout_names:
+        return
+    leaked = sorted(holdout_names.intersection(name for name in video_names if name))
+    if leaked:
+        raise SystemExit(
+            f"Holdout footage reached {source}: {', '.join(leaked)}. "
+            "Holdout videos must never be used for training."
+        )
+
+
 def generate_pose_dataset(dataset_config: dict):
     data_config = dataset_config["data"]
     processed_dir = Path(data_config["processed_dir"]).expanduser()
@@ -107,11 +127,20 @@ def generate_pose_dataset(dataset_config: dict):
     annotation_file = Path(data_config["annotation_file"]).expanduser()
     processed_dir.mkdir(parents=True, exist_ok=True)
 
+    holdout_dir = data_config.get("holdout_dir")
+    holdout_names = holdout_video_names(
+        Path(holdout_dir).expanduser() if holdout_dir else None
+    )
+
     annotations = load_annotations(annotation_file)
     annotation_by_video = {entry.get("video"): entry for entry in annotations}
     videos = discover_videos(raw_video_dir)
     if not videos:
         raise SystemExit(f"No videos found in {raw_video_dir}")
+
+    assert_no_holdout_videos(
+        [video_path.name for video_path in videos], holdout_names, raw_video_dir
+    )
 
     embedder = PersonEmbedder()
     estimator = DatasetPoseEstimator(dataset_config, embedder=embedder)
@@ -196,6 +225,9 @@ def generate_pose_dataset(dataset_config: dict):
         frame_widths,
         frame_heights,
         dataset_config,
+    )
+    assert_no_holdout_videos(
+        [entry.get("video") for entry in metadata], holdout_names, "generated samples"
     )
     save_metadata_json(processed_dir / "metadata.json", metadata)
     save_label_counts_json(

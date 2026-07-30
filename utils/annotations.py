@@ -21,6 +21,18 @@ def discover_videos(path: Path) -> list[Path]:
     return []
 
 
+def holdout_video_names(holdout_dir: Path | None) -> set[str]:
+    """
+    Return the filenames of every video in the holdout directory.
+
+    Holdout footage must never reach the training set; silently training on it
+    would invalidate every measurement made against it.
+    """
+    if holdout_dir is None:
+        return set()
+    return {p.name for p in discover_videos(Path(holdout_dir).expanduser())}
+
+
 def load_annotations(annotation_file: Path) -> list[dict]:
     """Load a JSON annotation file and return the list of entries."""
     with annotation_file.open("r", encoding="utf-8") as f:
