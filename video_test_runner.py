@@ -15,6 +15,7 @@ import random
 import cv2
 
 import config
+from action.live_buffer import ActionSequenceBuffer
 from action.runtime import create_live_action_components, update_live_action
 from reid.embedder import PersonEmbedder
 from reid.matcher import ReIDMatcher
@@ -26,6 +27,7 @@ from utils.annotations import (
     load_reference_embeddings,
 )
 from utils.geometry import box_area
+from utils.video_io import SequentialFrameReader
 
 REALISTIC_TARGET_FPS = 15
 DEFAULT_NUM_RUNS = 3          # how many times to run each video
@@ -34,6 +36,7 @@ REID_AFTER_MISSING_FRAMES = 8
 END_AFTER_MISSING_FRAMES = 90
 DEFAULT_ANNOTATION_FILE = Path("data/annotations/video_intervals.json")
 DEFAULT_ACTION_CONFIG = Path("action_classifier_config.toml")
+DEFAULT_OUTPUT_DIR = Path("video_test")
 
 
 class OfflineVideoRun:
@@ -43,10 +46,14 @@ class OfflineVideoRun:
         target_fps: int,
         embedder: PersonEmbedder,
         reference_embeddings=None,
+        output_dir: Path = DEFAULT_OUTPUT_DIR,
+        write_video: bool = True,
     ):
         self.video_path = video_path
         self.target_fps = target_fps
         self.embedder = embedder
+        self.output_dir = output_dir or DEFAULT_OUTPUT_DIR
+        self.write_video = write_video
         self.tracker = PersonTracker()
         self.matcher = ReIDMatcher(self.embedder)
 
@@ -83,44 +90,49 @@ class OfflineVideoRun:
             self.target_fps,
             seed=_seed_for(self.video_path, self.target_fps),
         )
-        writer_fps, frame_repeats = _writer_timing(self.target_fps)
+        writer = None
+        output_path = None
+        if self.write_video:
+            writer_fps, frame_repeats = _writer_timing(self.target_fps)
+            output_path = self._output_path()
+            writer = cv2.VideoWriter(
+                str(output_path),
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                float(writer_fps),
+                (width, height),
+            )
+            if not writer.isOpened():
+                cap.release()
+                print(f"[skip] Could not create {output_path}")
+                return
+            print(
+                f"[run] {self.video_path.name} -> {output_path.name} "
+                f"({self.target_fps}fps sample, {writer_fps}fps encode, "
+                f"{len(sample_indices)} samples)"
+            )
+        else:
+            frame_repeats = 0
 
-        output_path = self._output_path()
-        writer = cv2.VideoWriter(
-            str(output_path),
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            float(writer_fps),
-            (width, height),
-        )
-        if not writer.isOpened():
-            cap.release()
-            print(f"[skip] Could not create {output_path}")
-            return
-
-        print(
-            f"[run] {self.video_path.name} -> {output_path.name} "
-            f"({self.target_fps}fps sample, {writer_fps}fps encode, "
-            f"{len(sample_indices)} samples)"
-        )
-
+        reader = SequentialFrameReader(cap)
         for sample_number, frame_index in enumerate(sample_indices):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-            ok, frame = cap.read()
-            if not ok:
+            frame = reader.read(frame_index)
+            if frame is None:
                 continue
 
             people = self.tracker.detect(frame)
             self._update_tracking(frame, people)
-            annotated = self._draw(frame.copy(), people, sample_number, frame_index)
-            for _ in range(frame_repeats):
-                writer.write(annotated)
+            if writer is not None:
+                annotated = self._draw(frame.copy(), people, sample_number, frame_index)
+                for _ in range(frame_repeats):
+                    writer.write(annotated)
 
             if self.ended_early:
                 break
 
         cap.release()
-        writer.release()
-        print(f"[done] {output_path}")
+        if writer is not None:
+            writer.release()
+            print(f"[done] {output_path}")
 
     def _update_tracking(self, frame, people):
         self.last_scores = None
@@ -248,9 +260,8 @@ class OfflineVideoRun:
         return f"target missing {self.missing_frames}/{END_AFTER_MISSING_FRAMES}"
 
     def _output_path(self):
-        return self.video_path.with_name(
-            f"{self.video_path.stem}_tracked_skeleton_{self.target_fps}fps.mp4"
-        )
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        return self.output_dir / f"{self.video_path.stem}_tracked_skeleton_{self.target_fps}fps.mp4"
 
 
 class RealisticVideoRun(OfflineVideoRun):
@@ -269,24 +280,47 @@ class RealisticVideoRun(OfflineVideoRun):
         embedder,
         reference_embeddings=None,
         action_config_path=DEFAULT_ACTION_CONFIG,
+        output_dir: Path = None,
+        write_video: bool = True,
+        action_components=None,
     ):
         super().__init__(
             video_path,
             target_fps=REALISTIC_TARGET_FPS,
             embedder=embedder,
             reference_embeddings=reference_embeddings,
+            output_dir=output_dir,
+            write_video=write_video,
         )
         self.run_index = run_index
-        self.action_classifier, self.action_buffer, self.action_config = (
-            create_live_action_components(action_config_path)
-        )
+        if action_components is not None:
+            # Reuse an already-loaded classifier/config (expensive checkpoint
+            # read) across runs; the buffer still must be per-run state.
+            classifier, config_dict = action_components
+            self.action_classifier = classifier
+            self.action_config = config_dict
+            self.action_buffer = (
+                None
+                if classifier is None
+                else ActionSequenceBuffer(
+                    sequence_length=classifier.sequence_length,
+                    target_fps=config_dict["inference"]["target_fps"],
+                    classify_stride_sec=config_dict["inference"]["classify_stride_sec"],
+                    max_gap_sec=config_dict["inference"]["max_gap_sec"],
+                )
+            )
+        else:
+            self.action_classifier, self.action_buffer, self.action_config = (
+                create_live_action_components(action_config_path)
+            )
         self.action_prediction = None
         self._confident_swings = 0
+        self.swing_events = []  # [{"timestamp": float, "confidence": float}, ...]
 
     def process(self) -> dict:
         """
         Run the video and return a stats dict:
-            frames_total, frames_tracked, track_rate, swing_count, ended_early
+            frames_total, frames_tracked, track_rate, swing_count, ended_early, swing_events
         """
         cap = cv2.VideoCapture(str(self.video_path))
         if not cap.isOpened():
@@ -303,30 +337,37 @@ class RealisticVideoRun(OfflineVideoRun):
             REALISTIC_TARGET_FPS,
             seed=_seed_for(self.video_path, self.run_index),
         )
-        writer_fps, frame_repeats = _writer_timing(REALISTIC_TARGET_FPS)
-
-        output_path = self._output_path()
-        writer = cv2.VideoWriter(
-            str(output_path),
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            float(writer_fps),
-            (width, height),
-        )
-        if not writer.isOpened():
-            cap.release()
-            print(f"[skip] Could not create {output_path}")
-            return {}
-
-        print(
-            f"[run {self.run_index}] {self.video_path.name} -> {output_path.name} "
-            f"({REALISTIC_TARGET_FPS}fps ±jitter, {len(sample_indices)} samples)"
-        )
+        writer = None
+        output_path = None
+        if self.write_video:
+            writer_fps, frame_repeats = _writer_timing(REALISTIC_TARGET_FPS)
+            output_path = self._output_path()
+            writer = cv2.VideoWriter(
+                str(output_path),
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                float(writer_fps),
+                (width, height),
+            )
+            if not writer.isOpened():
+                cap.release()
+                print(f"[skip] Could not create {output_path}")
+                return {}
+            print(
+                f"[run {self.run_index}] {self.video_path.name} -> {output_path.name} "
+                f"({REALISTIC_TARGET_FPS}fps ±jitter, {len(sample_indices)} samples)"
+            )
+        else:
+            frame_repeats = 0
+            print(
+                f"[run {self.run_index}] {self.video_path.name} "
+                f"({REALISTIC_TARGET_FPS}fps ±jitter, {len(sample_indices)} samples, no video output)"
+            )
 
         frames_tracked = 0
+        reader = SequentialFrameReader(cap)
         for sample_number, frame_index in enumerate(sample_indices):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-            ok, frame = cap.read()
-            if not ok:
+            frame = reader.read(frame_index)
+            if frame is None:
                 continue
 
             timestamp = frame_index / source_fps
@@ -334,9 +375,10 @@ class RealisticVideoRun(OfflineVideoRun):
             people = self.tracker.detect(frame)
             self._update_tracking(frame, people)
             self._update_action(frame, timestamp)
-            annotated = self._draw(frame.copy(), people, sample_number, frame_index)
-            for _ in range(frame_repeats):
-                writer.write(annotated)
+            if writer is not None:
+                annotated = self._draw(frame.copy(), people, sample_number, frame_index)
+                for _ in range(frame_repeats):
+                    writer.write(annotated)
 
             if self.tracked_person is not None:
                 frames_tracked += 1
@@ -345,7 +387,8 @@ class RealisticVideoRun(OfflineVideoRun):
                 break
 
         cap.release()
-        writer.release()
+        if writer is not None:
+            writer.release()
 
         frames_total = sample_number + 1 if sample_indices else 0
         track_rate = frames_tracked / frames_total if frames_total else 0.0
@@ -360,6 +403,7 @@ class RealisticVideoRun(OfflineVideoRun):
             "track_rate": track_rate,
             "swing_count": self._confident_swings,
             "ended_early": self.ended_early,
+            "swing_events": self.swing_events,
         }
 
     def _update_action(self, frame, timestamp):
@@ -383,6 +427,9 @@ class RealisticVideoRun(OfflineVideoRun):
                 and (prev is None or not prev.is_confident or prev.label != "swing")
             ):
                 self._confident_swings += 1
+                self.swing_events.append(
+                    {"timestamp": timestamp, "confidence": prediction.confidence}
+                )
 
     def _draw(self, frame, people, sample_number, source_frame_index):
         frame = super()._draw(frame, people, sample_number, source_frame_index)
@@ -451,6 +498,12 @@ def main(argv=None):
         default=DEFAULT_NUM_RUNS,
         help=f"Number of test runs per video (each uses a different jitter seed). Default: {DEFAULT_NUM_RUNS}",
     )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help=f"Output directory for test videos. Default: {DEFAULT_OUTPUT_DIR}",
+    )
     args = parser.parse_args(argv)
 
     input_path = Path(
@@ -476,6 +529,7 @@ def main(argv=None):
                 embedder=embedder,
                 reference_embeddings=reference_embeddings,
                 action_config_path=args.action_config,
+                output_dir=args.output_dir,
             )
             stats = run.process()
             if stats:

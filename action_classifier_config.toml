@@ -13,8 +13,7 @@ split_manifest_file = "data/processed/action_classifier_split.json"
 [labels.label_to_id]
 # Background / no-action class; also used as the fallback when confidence is too low
 other = 0
-walk = 1
-swing = 2
+swing = 1
 
 [features]
 # Minimum YOLO keypoint confidence to treat a keypoint as valid; below this the position is zeroed
@@ -76,7 +75,7 @@ num_workers = 0
 # Hard cap on training iterations
 epochs = 30
 # Early-stopping patience: halt after this many epochs with no improvement in val macro F1
-patience = 6
+patience = 5
 # AdamW initial learning rate
 learning_rate = 0.001
 # AdamW L2 regularisation strength
@@ -84,7 +83,7 @@ weight_decay = 0.0001
 # Probability of randomly mirroring a sample left-right during training (left/right keypoints are also swapped)
 horizontal_flip_probability = 0.5
 # Probability of applying temporal jitter augmentation to a training sample
-temporal_jitter_probability = 0
+temporal_jitter_probability = 0.5
 # Maximum frame shift applied when temporal jitter is active
 max_temporal_jitter_frames = 1
 
@@ -101,10 +100,15 @@ confidence_threshold = 0.75
 fallback_label = "other"
 
 [inference.class_thresholds]
-# Per-class probability override for "swing"; effective threshold is max(this, confidence_threshold)
-swing = 0.90
+# Per-class probability override for "swing"; effective threshold is max(this, confidence_threshold).
+# Takes precedence over the threshold [calibration] baked into the checkpoint at
+# train time. Delete this section to fall back to that calibrated value —
+# training writes it into the .pt file, never back into this config.
+swing = 0.9
 
 [calibration]
+# The selected threshold is stored in the checkpoint's decision_config, not
+# written back here; [inference.class_thresholds] overrides it at inference time.
 # Class whose decision threshold is swept on the validation set after training
 label = "swing"
 # A candidate threshold is only accepted if its precision on the validation set meets this minimum

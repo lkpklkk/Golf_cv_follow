@@ -15,6 +15,7 @@ EVENTS_WINDOW_NAME = "Golf Impact Event Annotator"
 SUPPORTED_EXTS = [".mp4", ".mov", ".avi", ".mkv"]
 PLAYBACK_SPEEDS = [0.25, 0.5, 1.0, 1.5, 2.0, 4.0]
 DEFAULT_PLAYBACK_SPEED_INDEX = 2
+SEEK_STEP_SEC = 1.5
 
 
 def load_existing_annotations(out_file: Path):
@@ -312,8 +313,8 @@ def annotate_video(video_path: Path):
     print("] = faster playback")
     print(", = previous frame")
     print(". = next frame")
-    print("A = back 5 sec, capped by latest labeled end")
-    print("D = forward 5 sec")
+    print(f"A = back {SEEK_STEP_SEC:g} sec, capped by latest labeled end")
+    print(f"D = forward {SEEK_STEP_SEC:g} sec")
     print("U = delete previous marking")
     print("N = save and next")
     print("K = skip")
@@ -580,7 +581,7 @@ def annotate_video(video_path: Path):
                     f"{frame_to_seconds(target_frame, fps):.2f}s"
                 )
 
-        # a: back 5 seconds
+        # a: back 1.5 seconds
         elif key == ord("a"):
             current_frame = get_current_frame_idx(cap)
 
@@ -589,7 +590,7 @@ def annotate_video(video_path: Path):
             # unless you undo/delete that previous marking first.
             min_back_frame = latest_labeled_end_frame(intervals, fps)
 
-            target_frame = max(current_frame - seconds_to_frame(5.0, fps), min_back_frame)
+            target_frame = max(current_frame - seconds_to_frame(SEEK_STEP_SEC, fps), min_back_frame)
             frame, target_frame = read_frame_at(cap, target_frame, total_frames)
             if frame is not None:
                 last_frame = frame
@@ -600,11 +601,11 @@ def annotate_video(video_path: Path):
                 )
 
 
-        # d: forward 5 seconds
+        # d: forward 1.5 seconds
         elif key == ord("d"):
             current_frame = get_current_frame_idx(cap)
 
-            target_frame = min(current_frame + seconds_to_frame(5.0, fps), total_frames - 1)
+            target_frame = min(current_frame + seconds_to_frame(SEEK_STEP_SEC, fps), total_frames - 1)
             frame, target_frame = read_frame_at(cap, target_frame, total_frames)
             if frame is not None:
                 last_frame = frame
@@ -1027,6 +1028,16 @@ def parse_args(argv=None):
         help="Directory of videos to annotate.",
     )
     parser.add_argument(
+        "--video",
+        type=Path,
+        default=None,
+        help=(
+            "Annotate a single video file instead of a directory. If it "
+            "already has an entry in the output JSON, that entry is "
+            "overwritten; otherwise a new entry is appended."
+        ),
+    )
+    parser.add_argument(
         "--out",
         type=Path,
         default=None,
@@ -1045,21 +1056,29 @@ def main(argv=None):
         )
         return
 
-    video_dir = args.video_dir or VIDEO_DIR
     out_file = args.out or OUT_FILE
-
-    videos = get_video_files(video_dir)
-
-    if not videos:
-        print(f"No videos found in {video_dir}")
-        return
-
     annotations = load_existing_annotations(out_file)
-    already_annotated = {a["video"] for a in annotations}
-    videos = choose_video_queue(videos, annotations)
 
-    print(f"Found {len(videos)} videos.")
-    print(f"Existing annotations: {len(already_annotated)}")
+    if args.video:
+        if not args.video.exists():
+            print(f"Video not found: {args.video}")
+            return
+        videos = [args.video]
+        already_annotated = set()  # single-video mode always (re)annotates
+        print(f"Annotating single video: {args.video.name}")
+    else:
+        video_dir = args.video_dir or VIDEO_DIR
+        videos = get_video_files(video_dir)
+
+        if not videos:
+            print(f"No videos found in {video_dir}")
+            return
+
+        already_annotated = {a["video"] for a in annotations}
+        videos = choose_video_queue(videos, annotations)
+
+        print(f"Found {len(videos)} videos.")
+        print(f"Existing annotations: {len(already_annotated)}")
 
     for video_path in videos:
         # Skip already annotated videos by default.

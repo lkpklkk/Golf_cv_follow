@@ -34,9 +34,18 @@ def create_live_action_components(config_path="action_classifier_config.toml"):
         classify_stride_sec=inference["classify_stride_sec"],
         max_gap_sec=inference["max_gap_sec"],
     )
+    # Both sources are printed because they disagree silently: the checkpoint
+    # carries whatever calibration selected during training, the config carries
+    # whatever was hand-tuned since, and only the latter is applied per call.
     print(
         f"[Action] loaded {checkpoint_path} "
         f"window={classifier.sequence_length} frames"
+    )
+    print(
+        f"[Action] thresholds: confidence={inference['confidence_threshold']} "
+        f"config class_thresholds={dict(inference.get('class_thresholds') or {})} "
+        f"checkpoint class_thresholds="
+        f"{dict(classifier.decision_config.get('class_thresholds') or {})}"
     )
     return classifier, buffer, config
 
@@ -72,4 +81,9 @@ def update_live_action(
         frame_height=buffer.frame_height,
         confidence_threshold=inference["confidence_threshold"],
         fallback_label=inference["fallback_label"],
+        # Passed explicitly, like the two above: without it the config section
+        # loses to whatever calibration baked into the checkpoint at train
+        # time, and editing the TOML silently does nothing. Omitting the
+        # section from the config still falls back to the calibrated value.
+        class_thresholds=inference.get("class_thresholds"),
     )

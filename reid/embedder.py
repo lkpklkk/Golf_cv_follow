@@ -144,27 +144,38 @@ class PersonEmbedder:
             List aligned with `boxes`; entries are numpy float32 embeddings or
             None when a crop is invalid.
         """
-        boxes = list(boxes)
+        return self.embed_grouped([(frame, boxes)])[0]
+
+    def embed_grouped(self, groups):
+        """
+        Embed boxes drawn from several frames in a single model pass.
+
+        Same results as calling embed_many() once per group, but one forward
+        instead of N. Callers that already process frames in batches (dataset
+        generation) otherwise pay a launch round-trip per frame, which on MPS
+        costs more than the forward itself.
+
+        Args:
+            groups: Iterable of (frame, boxes) pairs.
+
+        Returns:
+            List of per-group lists, each aligned with that group's boxes;
+            entries are numpy float32 embeddings or None for invalid crops.
+        """
+        groups = [(frame, list(boxes)) for frame, boxes in groups]
+        outputs = [[None for _ in boxes] for _, boxes in groups]
         if not self.available:
-            return [None for _ in boxes]
+            return outputs
 
-        h, w = frame.shape[:2]
         tensors = []
-        valid_indices = []
-        outputs = [None for _ in boxes]
-
-        for i, box in enumerate(boxes):
-            x1, y1, x2, y2 = box
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(w, x2), min(h, y2)
-
-            if x2 <= x1 or y2 <= y1:
-                continue
-
-            crop = frame[y1:y2, x1:x2]
-            crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-            tensors.append(self._transform(crop_rgb))
-            valid_indices.append(i)
+        slots = []
+        for group_index, (frame, boxes) in enumerate(groups):
+            for box_index, box in enumerate(boxes):
+                crop_rgb = self._crop_rgb(frame, box)
+                if crop_rgb is None:
+                    continue
+                tensors.append(self._transform(crop_rgb))
+                slots.append((group_index, box_index))
 
         if not tensors:
             return outputs
@@ -176,7 +187,19 @@ class PersonEmbedder:
         norms = np.linalg.norm(feats, axis=1, keepdims=True)
         feats = np.divide(feats, norms, out=np.zeros_like(feats), where=norms > 0)
 
-        for i, feat in zip(valid_indices, feats):
-            outputs[i] = feat.astype(np.float32)
+        for (group_index, box_index), feat in zip(slots, feats):
+            outputs[group_index][box_index] = feat.astype(np.float32)
 
         return outputs
+
+    def _crop_rgb(self, frame, box):
+        """Clamp `box` to the frame and return the RGB crop, or None if empty."""
+        x1, y1, x2, y2 = box
+        h, w = frame.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        return cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)

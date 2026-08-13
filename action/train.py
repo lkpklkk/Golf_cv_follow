@@ -203,6 +203,15 @@ def train_from_config(config_path):
         f"[action test] accuracy={test_metrics['accuracy']:.4f} "
         f"macro_f1={test_metrics['macro_f1']:.4f}"
     )
+    print(f"{'label':<8} {'precision':>9} {'recall':>9} {'f1':>9} {'support':>9}")
+    for label, class_metrics in test_metrics["per_class"].items():
+        print(
+            f"{label:<8} "
+            f"{class_metrics['precision']:>9.4f} "
+            f"{class_metrics['recall']:>9.4f} "
+            f"{class_metrics['f1']:>9.4f} "
+            f"{class_metrics['support']:>9d}"
+        )
     return metrics
 
 

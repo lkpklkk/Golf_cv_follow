@@ -9,12 +9,10 @@ data:
 labels:
   classes:
     - other
-    - walk
     - swing
   label_to_id:
     other: 0
-    walk: 1
-    swing: 2
+    swing: 1
 
 sampling:
   target_fps: 15
@@ -24,20 +22,38 @@ sampling:
   timestamp_jitter_seed: 42
 
 windowing:
-  include_unlabeled_as_other: false
-  swing_stride_sec: 0.15
-  walk_stride_sec: 0.25
-  other_stride_sec: 0.5
-  swing_overlap_threshold: 0.3
-  walk_overlap_threshold: 0.5
-  other_overlap_threshold: 0.5
+  include_unlabeled_as_other: false      # was false — unlocks 55.6 min of negatives
+  # Per video, not global — create_windows() runs once per video. Across the 46
+  # labeled videos this yields ~1,710 background windows total. See Stage 3 of
+  # ACTION_PIPELINE_REWORK.md for the measured alternatives.
+  max_background_windows: 25
+ 
+  swing_stride_sec: 0.05
+  swing_overlap_threshold: 0.8      # was 0.30
+  swing_ignore_below: 0.10              # below this, eligible as negative
+
+  # Formerly-walk intervals are now `other`; 0.1 keeps their window density from
+  # collapsing 5x, which would leave swing outnumbering the negatives.
+  other_stride_sec: 0.1
+  other_overlap_threshold: 1        # unchanged
 
 priority:
   - swing
-  - walk
   - other
 
 pose:
   model_name: "yolo26s-pose.pt"
   pose_conf_threshold: 0.25
   max_missing_frame_ratio: 0.3
+  # Frames per YOLO/Re-ID forward pass. Raise for more GPU throughput, lower if
+  # inference runs out of memory.
+  batch_size: 16
+  # Always take the largest detected person and never run Re-ID: reference
+  # images in the annotations are ignored and no embedding is computed. Turn on
+  # when the similarity gate is rejecting the target on most frames; leave off
+  # for footage where a bystander can be closer to the camera than the golfer.
+  use_largest_box_frame: true
+  # Renders one annotated mp4 per sample into processed_dir/sample_videos.
+  # Off by default: it re-decodes 30 frames per window, which costs more than
+  # the rest of generation combined.
+  write_debug_videos: true
