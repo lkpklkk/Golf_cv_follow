@@ -57,3 +57,9 @@ pose:
   # Off by default: it re-decodes 30 frames per window, which costs more than
   # the rest of generation combined.
   write_debug_videos: true
+  # Draws the classifier's 19 input features (numbers + bars) down the right
+  # edge of each debug video. Only applies when write_debug_videos is on.
+  debug_video_feature_overlay: true
+  # Per-feature ranges used to scale those bars, written by golf_cv_feature_stats.
+  # Missing file = numbers still shown, bars omitted.
+  feature_stats_file: "feature_norm_stats.json"

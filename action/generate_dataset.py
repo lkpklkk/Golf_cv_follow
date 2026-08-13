@@ -17,8 +17,15 @@ import cv2
 import numpy as np
 
 import config
+from action.feature_stats import DEFAULT_STATS_FILE, load_feature_stats
+from action.preprocessing import (
+    frame_feature_vector,
+    keypoint_valid_mask,
+    preprocess_pose_sequence,
+)
 from reid.embedder import PersonEmbedder
 from reid.matcher import ReIDMatcher
+from ui.feature_overlay import draw_feature_panel
 from ui.overlay import _COCO_SKELETON
 from utils.annotations import (
     discover_videos,
@@ -336,6 +343,7 @@ def process_dataset_video(
     sequence_length = int(sampling_config["sequence_length"])
     max_missing_ratio = float(pose_config.get("max_missing_frame_ratio", 0.3))
     write_debug_videos = bool(pose_config.get("write_debug_videos", False))
+    feature_stats = _debug_feature_stats(dataset_config) if write_debug_videos else None
 
     samples = []
     labels = []
@@ -434,6 +442,8 @@ def process_dataset_video(
                 read_frames(cap, frame_indices),
                 keypoints,
                 dataset_config,
+                feature_stats=feature_stats,
+                title=f"{window.label_name} @{window.start_sec:.2f}s",
             )
 
     cap.release()
@@ -489,6 +499,28 @@ def load_dataset_config(config_path: Path) -> dict:
         raise SystemExit(f"Dataset config must be a mapping: {path}")
 
     return _normalize_dataset_config(loaded)
+
+
+def _debug_feature_stats(dataset_config: dict):
+    """
+    Load the bar-normalisation ranges for debug videos, warning once if absent.
+
+    Missing stats are not fatal: the panel still prints every number, it just
+    cannot scale the bars. Bootstrapping needs this — the stats are measured
+    from samples.npz, which does not exist before the first generation run.
+    """
+    pose_config = dataset_config.get("pose", {})
+    if not pose_config.get("debug_video_feature_overlay", True):
+        return None
+
+    stats_path = Path(pose_config.get("feature_stats_file", DEFAULT_STATS_FILE))
+    stats = load_feature_stats(stats_path)
+    if stats is None:
+        print(
+            f"[dataset warn] feature stats not found at {stats_path}; debug "
+            "videos will show values without bars. Run golf_cv_feature_stats."
+        )
+    return stats
 
 
 def use_largest_box_frame(dataset_config: dict) -> bool:
@@ -809,15 +841,22 @@ def save_label_counts_json(path: Path, label_counts, label_names):
     print(f"[dataset save] {path}")
 
 
-def write_debug_video(path: Path, frames, keypoint_sequence, dataset_config: dict):
+def write_debug_video(
+    path: Path,
+    frames,
+    keypoint_sequence,
+    dataset_config: dict,
+    feature_stats=None,
+    title=None,
+):
     if not frames:
         return
 
     height, width = frames[0].shape[:2]
     fps = float(dataset_config["sampling"]["target_fps"])
-    pose_conf_threshold = float(
-        dataset_config.get("pose", {}).get("pose_conf_threshold", 0.25)
-    )
+    pose_config = dataset_config.get("pose", {})
+    pose_conf_threshold = float(pose_config.get("pose_conf_threshold", 0.25))
+    draw_features = bool(pose_config.get("debug_video_feature_overlay", True))
     writer = cv2.VideoWriter(
         str(path),
         cv2.VideoWriter_fourcc(*"mp4v"),
@@ -828,7 +867,19 @@ def write_debug_video(path: Path, frames, keypoint_sequence, dataset_config: dic
         print(f"[dataset warn] could not create debug video: {path}")
         return
 
-    for frame, keypoints in zip(frames, keypoint_sequence):
+    # Computed once for the clip: the features are a function of the whole
+    # sequence (velocities and rotation deltas need the previous frame), so
+    # they cannot be derived frame by frame.
+    sequence_features = None
+    if draw_features:
+        sequence_features = preprocess_pose_sequence(
+            np.asarray(keypoint_sequence, dtype=np.float32),
+            width,
+            height,
+            confidence_threshold=pose_conf_threshold,
+        )
+
+    for index, (frame, keypoints) in enumerate(zip(frames, keypoint_sequence)):
         annotated = frame.copy()
         _draw_dataset_pose(
             annotated,
@@ -836,6 +887,15 @@ def write_debug_video(path: Path, frames, keypoint_sequence, dataset_config: dic
             color=(0, 255, 0),
             conf_threshold=pose_conf_threshold,
         )
+        if sequence_features is not None and index < len(sequence_features):
+            valid = keypoint_valid_mask(keypoints, pose_conf_threshold)
+            draw_feature_panel(
+                annotated,
+                frame_feature_vector(sequence_features[index], valid),
+                stats=feature_stats,
+                title=title if title else f"frame {index + 1}/{len(frames)}",
+                no_data=not bool(valid.any()),
+            )
         writer.write(annotated)
 
     writer.release()
@@ -866,6 +926,8 @@ def _normalize_dataset_config(dataset_config: dict):
     dataset_config["pose"].setdefault("batch_size", 16)
     dataset_config["pose"].setdefault("write_debug_videos", False)
     dataset_config["pose"].setdefault("use_largest_box_frame", False)
+    dataset_config["pose"].setdefault("debug_video_feature_overlay", True)
+    dataset_config["pose"].setdefault("feature_stats_file", str(DEFAULT_STATS_FILE))
 
     labels = dataset_config["labels"]
     if "other" not in labels.get("label_to_id", {}):

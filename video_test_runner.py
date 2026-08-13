@@ -15,11 +15,18 @@ import random
 import cv2
 
 import config
+from action.feature_stats import load_feature_stats
 from action.live_buffer import ActionSequenceBuffer
+from action.preprocessing import (
+    frame_feature_vector,
+    keypoint_valid_mask,
+    preprocess_pose_sequence,
+)
 from action.runtime import create_live_action_components, update_live_action
 from reid.embedder import PersonEmbedder
 from reid.matcher import ReIDMatcher
 from tracker.person_tracker import PersonTracker
+from ui.feature_overlay import draw_feature_panel
 from ui.overlay import _COCO_SKELETON
 from utils.annotations import (
     discover_videos,
@@ -316,6 +323,9 @@ class RealisticVideoRun(OfflineVideoRun):
         self.action_prediction = None
         self._confident_swings = 0
         self.swing_events = []  # [{"timestamp": float, "confidence": float}, ...]
+        # Only needed when rendering; evaluate_detection and the sweep run with
+        # write_video=False and would otherwise pay the file read per run.
+        self._feature_stats = load_feature_stats() if write_video else None
 
     def process(self) -> dict:
         """
@@ -455,7 +465,39 @@ class RealisticVideoRun(OfflineVideoRun):
                 2,
             )
 
+        self._draw_features(frame)
         return frame
+
+    def _draw_features(self, frame):
+        """
+        Panel of the classifier's current input features.
+
+        Sourced from the buffer's last classified window rather than the
+        current frame: classification is throttled to classify_stride_sec, so
+        this steps at ~4Hz and shows exactly what the live prediction was made
+        from. The dataset debug clips are the per-frame view.
+        """
+        buffer = self.action_buffer
+        sequence = getattr(buffer, "last_sequence", None) if buffer else None
+        if sequence is None or self._feature_stats is None:
+            return
+
+        features = preprocess_pose_sequence(
+            sequence,
+            buffer.frame_width or frame.shape[1],
+            buffer.frame_height or frame.shape[0],
+            confidence_threshold=self.action_config["features"]["confidence_threshold"],
+        )
+        valid = keypoint_valid_mask(
+            sequence[-1], self.action_config["features"]["confidence_threshold"]
+        )
+        draw_feature_panel(
+            frame,
+            frame_feature_vector(features[-1], valid),
+            stats=self._feature_stats,
+            title="features (last classified)",
+            no_data=not bool(valid.any()),
+        )
 
     def _output_path(self):
         return self.video_path.with_name(

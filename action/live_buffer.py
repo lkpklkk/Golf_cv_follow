@@ -23,6 +23,11 @@ class ActionSequenceBuffer:
         self._last_prediction_time = None
         self.frame_width = None
         self.frame_height = None
+        # Most recent window handed to the classifier, kept so debug overlays
+        # can show the exact input behind the current prediction. Updated only
+        # when a classification actually happens, so it lags by up to
+        # classify_stride_sec.
+        self.last_sequence = None
 
     def reset(self):
         self._samples.clear()
@@ -30,6 +35,7 @@ class ActionSequenceBuffer:
         self._last_prediction_time = None
         self.frame_width = None
         self.frame_height = None
+        self.last_sequence = None
 
     def add(self, target_id, timestamp, keypoints, frame_width, frame_height):
         if target_id is None:
@@ -69,6 +75,7 @@ class ActionSequenceBuffer:
         resampled = self._resample(timestamp)
         if resampled is not None:
             self._last_prediction_time = timestamp
+            self.last_sequence = resampled
         return resampled
 
     def _resample(self, end_time):

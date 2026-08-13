@@ -25,6 +25,12 @@ FEATURE_NAMES = (
     "shoulder_rotation_delta",
     "hip_rotation_delta",
 )
+# FEATURE_NAMES splits in two: the first PER_KEYPOINT_FEATURE_COUNT entries hold
+# a different value for each of the 17 keypoints, while the rest are per-frame
+# scalars that preprocess_pose_sequence() repeats across every keypoint (see the
+# np.repeat below). Anything summarising a frame has to treat the halves
+# differently, hence the boundary constant.
+PER_KEYPOINT_FEATURE_COUNT = 9
 LEFT_RIGHT_PAIRS = (
     (1, 2),
     (3, 4),
@@ -90,6 +96,55 @@ def preprocess_pose_sequence(
     )
     features = np.concatenate([keypoint_features, repeated_swing_features], axis=-1)
     return features.astype(np.float32)
+
+
+def frame_feature_vector(frame_features, valid_mask=None):
+    """
+    Collapse one frame of (17, 19) features into 19 displayable scalars.
+
+    The per-keypoint half is averaged as absolute values over the valid
+    keypoints only — preprocess_pose_sequence() zeroes invalid rows, so
+    averaging across all 17 would pull the number toward zero in proportion to
+    how many joints were missing, which reads as "the body stopped moving"
+    rather than "we could not see it". Absolute values because the signed mean
+    of a body-centred coordinate is ~0 by construction and would show nothing.
+
+    The per-frame half is read straight off keypoint 0: those columns are
+    identical across all 17 keypoints, so any row gives the exact model input.
+
+    Args:
+        frame_features: (17, 19) array for a single frame.
+        valid_mask:     (17,) bool array of usable keypoints. None treats every
+                        keypoint with a non-zero feature row as valid.
+
+    Returns:
+        (19,) float32 array. All-invalid frames return zeros.
+    """
+    features = np.asarray(frame_features, dtype=np.float32)
+    if features.ndim != 2 or features.shape[1] != len(FEATURE_NAMES):
+        raise ValueError(
+            f"Expected frame features with shape (17, {len(FEATURE_NAMES)}), "
+            f"got {features.shape}"
+        )
+
+    if valid_mask is None:
+        valid = np.any(features[:, :PER_KEYPOINT_FEATURE_COUNT] != 0.0, axis=1)
+    else:
+        valid = np.asarray(valid_mask, dtype=bool)
+
+    output = np.zeros(len(FEATURE_NAMES), dtype=np.float32)
+    if valid.any():
+        output[:PER_KEYPOINT_FEATURE_COUNT] = np.abs(
+            features[valid, :PER_KEYPOINT_FEATURE_COUNT]
+        ).mean(axis=0)
+    output[PER_KEYPOINT_FEATURE_COUNT:] = features[0, PER_KEYPOINT_FEATURE_COUNT:]
+    return output
+
+
+def keypoint_valid_mask(keypoints, confidence_threshold=0.25):
+    """Per-keypoint validity for a (17, 3) pose, matching preprocess_pose_sequence."""
+    pose = np.asarray(keypoints, dtype=np.float32)
+    return np.clip(pose[..., 2], 0.0, 1.0) >= float(confidence_threshold)
 
 
 def horizontal_flip_sequence(keypoints, frame_width):

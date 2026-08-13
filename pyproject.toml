@@ -35,6 +35,7 @@ golf_cv_annotate = "utils.annotate_intervals:main"
 golf_cv_train_action = "action.train:main"
 golf_cv_evaluate_detection = "action.evaluate_detection:main"
 golf_cv_sweep_swing_threshold = "action.sweep_swing_threshold:main"
+golf_cv_feature_stats = "action.feature_stats:main"
 
 [tool.setuptools]
 py-modules = [
